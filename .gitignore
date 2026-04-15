@@ -1,0 +1,27 @@
+# Rust
+/target
+Cargo.lock.bak
+**/*.rs.bk
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / Editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Env / local config
+.env
+.env.local
+
+# Output artifacts
+*.csv
