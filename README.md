@@ -25,21 +25,21 @@ A fast, btop-style terminal UI for monitoring Android device and per-app perform
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/android-perf-monitor.git
-cd android-perf-monitor
+git clone https://github.com/aabolfazl/android-perf.git
+cd android-perf
 cargo build --release
 ```
 
-The binary will be at `target/release/android-perf-monitor`.
+The binary will be at `target/release/android-perf`.
 
 ## Usage
 
 ```bash
 # Pick device and package interactively
-./target/release/android-perf-monitor
+./target/release/android-perf
 
 # Or pass everything via flags
-./target/release/android-perf-monitor \
+./target/release/android-perf \
   --device <serial> \
   --package com.example.app \
   --interval 1
