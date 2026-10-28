@@ -1,3 +1,4 @@
+mod agent;
 mod app;
 mod data;
 mod recorder;
@@ -16,6 +17,7 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::prelude::*;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, Level};
@@ -53,6 +55,14 @@ struct Args {
     /// Write one CSV row per sample to this file
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Start the on-device capture agent: per-app traffic, connections and domains
+    #[arg(long)]
+    capture: bool,
+
+    /// Save the agent's packet capture to this file for Wireshark (implies --capture)
+    #[arg(long, value_name = "FILE")]
+    pcap: Option<PathBuf>,
 }
 
 fn parse_package(value: &str) -> Result<String, String> {
@@ -91,6 +101,7 @@ async fn main() -> Result<()> {
 
     let mut app = App::new(args.package.clone(), recorder);
     app.device_serial = args.device.clone();
+    app.capture_wanted = args.capture || args.pcap.is_some();
 
     let shared_package = create_shared_package(args.package.clone());
     app.shared_package = Some(shared_package.clone());
@@ -98,7 +109,7 @@ async fn main() -> Result<()> {
     let (key_tx, key_rx) = mpsc::unbounded_channel::<KeyEvent>();
     tokio::spawn(keyboard_task(key_tx));
 
-    let result = run_app(&mut terminal, &mut app, key_rx, shared_package, args.interval).await;
+    let result = run_app(&mut terminal, &mut app, key_rx, shared_package, args.interval, args.pcap).await;
 
     restore_terminal()?;
 
@@ -149,12 +160,28 @@ async fn keyboard_task(key_tx: mpsc::UnboundedSender<KeyEvent>) {
     }
 }
 
-fn start_collectors(app: &App, shared_package: &SharedPackage, interval_secs: u64) -> RunnerHandle {
+fn start_collectors(app: &App, shared_package: &SharedPackage, interval_secs: u64, pcap: &Option<PathBuf>) -> RunnerHandle {
     spawn_runners(RunnerConfig {
         device_serial: app.device_serial.clone(),
         shared_package: shared_package.clone(),
         interval_secs,
+        pcap_path: pcap.clone(),
     })
+}
+
+/// Starts or stops the agent on the phone in the background; failures show in the footer.
+fn spawn_capture_command(sender: &mpsc::UnboundedSender<PanelUpdate>, serial: String, start: bool) {
+    let sender = sender.clone();
+    tokio::spawn(async move {
+        let result = if start {
+            agent::start_capture(Some(&serial), None).await
+        } else {
+            agent::stop_capture(Some(&serial)).await
+        };
+        if let Err(e) = result {
+            let _ = sender.send(PanelUpdate::CaptureError(e.to_string()));
+        }
+    });
 }
 
 async fn run_app<B: Backend>(
@@ -163,10 +190,13 @@ async fn run_app<B: Backend>(
     mut key_rx: mpsc::UnboundedReceiver<KeyEvent>,
     shared_package: SharedPackage,
     interval_secs: u64,
+    pcap: Option<PathBuf>,
 ) -> Result<()> {
     let draw_interval = Duration::from_millis(16);
     let mut draw_timer = tokio::time::interval(draw_interval);
-    let mut collectors = start_collectors(app, &shared_package, interval_secs);
+    let mut collectors = start_collectors(app, &shared_package, interval_secs, &pcap);
+    // Device the capture agent was started on by us.
+    let mut capture_on: Option<String> = None;
 
     terminal.draw(|frame| ui::draw(frame, app))?;
 
@@ -176,7 +206,7 @@ async fn run_app<B: Backend>(
 
             Some(key_event) = key_rx.recv() => {
                 if handle_key_event(app, key_event) {
-                    return Ok(());
+                    break;
                 }
                 terminal.draw(|frame| ui::draw(frame, app))?;
             }
@@ -193,9 +223,27 @@ async fn run_app<B: Backend>(
         // Picking a device (or the first device showing up) needs a new adb shell for that serial.
         if app.device_serial != collectors.device_serial {
             info!("Device changed to {:?}, restarting collectors", app.device_serial);
-            collectors = start_collectors(app, &shared_package, interval_secs);
+            collectors = start_collectors(app, &shared_package, interval_secs, &pcap);
+        }
+
+        // Keep the agent running on the current device exactly while the user wants it.
+        let capture_target = if app.capture_wanted { app.device_serial.clone() } else { None };
+        if capture_target != capture_on {
+            if let Some(old) = capture_on.take() {
+                spawn_capture_command(&collectors.sender, old, false);
+            }
+            if let Some(new) = capture_target.clone() {
+                spawn_capture_command(&collectors.sender, new, true);
+            }
+            capture_on = capture_target;
         }
     }
+
+    // Don't leave the phone's VPN running after we quit.
+    if let Some(serial) = capture_on {
+        let _ = tokio::time::timeout(Duration::from_secs(3), agent::stop_capture(Some(&serial))).await;
+    }
+    Ok(())
 }
 
 fn handle_key_event(app: &mut App, key_event: KeyEvent) -> bool {
@@ -246,11 +294,20 @@ fn handle_panel_update(app: &mut App, update: PanelUpdate) {
             app.last_error = Some(format!("[{}] {}", panel, message));
             return;
         }
-        _ => {}
+        PanelUpdate::CaptureError(message) => {
+            app.capture_error = Some(format!("[capture] {}", message));
+            return;
+        }
+        PanelUpdate::CaptureStopped => {
+            app.capture = None;
+            return;
+        }
+        PanelUpdate::Capture(_) => {}
+        _ => {
+            // Any sample from the adb shell means it works again.
+            app.last_error = None;
+        }
     }
-
-    // Any sample means the shell works again.
-    app.last_error = None;
 
     if app.paused {
         return;
@@ -338,6 +395,13 @@ fn handle_panel_update(app: &mut App, update: PanelUpdate) {
         PanelUpdate::Jobs(data) => {
             app.jobs_data = data;
         }
-        PanelUpdate::Devices(_) | PanelUpdate::Packages(_) | PanelUpdate::Error { .. } => {}
+        PanelUpdate::Capture(snapshot) => {
+            app.on_capture(*snapshot);
+        }
+        PanelUpdate::Devices(_)
+        | PanelUpdate::Packages(_)
+        | PanelUpdate::Error { .. }
+        | PanelUpdate::CaptureError(_)
+        | PanelUpdate::CaptureStopped => {}
     }
 }

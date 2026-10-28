@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -34,6 +35,12 @@ pub enum PanelUpdate {
     Jobs(JobsData),
     Devices(Vec<DeviceData>),
     Packages(Vec<String>),
+    /// Latest numbers from the on-device capture agent.
+    Capture(Box<crate::agent::proto::Snapshot>),
+    /// The agent stopped or went away.
+    CaptureStopped,
+    /// Starting or stopping the capture failed.
+    CaptureError(String),
     Error { panel: &'static str, message: String },
 }
 
@@ -141,12 +148,16 @@ pub struct RunnerConfig {
     pub device_serial: Option<String>,
     pub shared_package: SharedPackage,
     pub interval_secs: u64,
+    /// Where to save the agent's packet capture, if anywhere.
+    pub pcap_path: Option<PathBuf>,
 }
 
 /// The collectors for one device. Dropping the handle stops them and their adb shell.
 pub struct RunnerHandle {
     pub device_serial: Option<String>,
     pub updates: mpsc::UnboundedReceiver<PanelUpdate>,
+    /// For reporting results of one-off commands (such as starting the capture) to the UI.
+    pub sender: mpsc::UnboundedSender<PanelUpdate>,
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -167,7 +178,7 @@ pub fn spawn_runners(config: RunnerConfig) -> RunnerHandle {
     let period = Duration::from_secs(config.interval_secs.max(1));
     let slow_period = period * 2;
 
-    let handles = vec![
+    let mut handles = vec![
         tokio::spawn(cpu_runner(tx.clone(), Arc::clone(&shell), Arc::clone(&pkg), period)),
         tokio::spawn(memory_runner(tx.clone(), Arc::clone(&shell), Arc::clone(&pkg), period)),
         tokio::spawn(battery_runner(tx.clone(), Arc::clone(&shell), period)),
@@ -178,12 +189,17 @@ pub fn spawn_runners(config: RunnerConfig) -> RunnerHandle {
         tokio::spawn(alarms_runner(tx.clone(), Arc::clone(&shell), Arc::clone(&pkg), slow_period)),
         tokio::spawn(jobs_runner(tx.clone(), Arc::clone(&shell), Arc::clone(&pkg), slow_period)),
         tokio::spawn(devices_runner(tx.clone())),
-        tokio::spawn(packages_runner(tx, shell)),
+        tokio::spawn(packages_runner(tx.clone(), shell)),
+        tokio::spawn(crate::agent::snapshot_runner(tx.clone(), config.device_serial.clone())),
     ];
+    if let Some(path) = config.pcap_path {
+        handles.push(tokio::spawn(crate::agent::pcap_runner(tx.clone(), config.device_serial.clone(), path)));
+    }
 
     RunnerHandle {
         device_serial: config.device_serial,
         updates,
+        sender: tx,
         handles,
     }
 }

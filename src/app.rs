@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+use crate::agent::proto;
 use crate::data::{DeviceInfo, Metrics};
 use crate::recorder::CsvRecorder;
 
@@ -38,6 +40,24 @@ pub enum Popup {
 pub enum FocusedPanel {
     None,
     Threads,
+    Connections,
+}
+
+/// The latest snapshot from the capture agent, plus rates computed from the one before.
+pub struct CaptureState {
+    pub snapshot: proto::Snapshot,
+    /// Bytes per second by uid since the previous snapshot: (received, sent).
+    pub rates: HashMap<i32, (u64, u64)>,
+}
+
+/// Captured traffic of the selected package, or of all apps in device mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct CaptureTraffic {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_rate: u64,
+    pub tx_rate: u64,
+    pub open_connections: u32,
 }
 
 pub const HISTORY_LEN: usize = 60;
@@ -91,6 +111,13 @@ pub struct App {
     pub recorder: Option<CsvRecorder>,
     /// Kept until exit, unlike `last_error`, which clears on the next good sample.
     pub recorder_error: Option<String>,
+
+    pub capture: Option<CaptureState>,
+    /// The user wants the on-device capture running (`c` or `--capture`).
+    pub capture_wanted: bool,
+    pub capture_error: Option<String>,
+    pub capture_rx_history: Vec<u64>,
+    pub capture_tx_history: Vec<u64>,
 }
 
 impl App {
@@ -144,6 +171,12 @@ impl App {
             shared_package: None,
             recorder,
             recorder_error: None,
+
+            capture: None,
+            capture_wanted: false,
+            capture_error: None,
+            capture_rx_history: Vec::with_capacity(HISTORY_LEN),
+            capture_tx_history: Vec::with_capacity(HISTORY_LEN),
         }
     }
 
@@ -164,12 +197,11 @@ impl App {
     fn handle_main_key(&mut self, key: char) -> bool {
         match key {
             'q' => return true,
-            'f' => {
-                self.focused_panel = if self.focused_panel != FocusedPanel::None {
-                    FocusedPanel::None
-                } else {
-                    FocusedPanel::Threads
-                };
+            'f' => self.toggle_focus(FocusedPanel::Threads),
+            'n' => self.toggle_focus(FocusedPanel::Connections),
+            'c' => {
+                self.capture_wanted = !self.capture_wanted;
+                self.capture_error = None;
             }
             'd' => self.popup = Popup::SelectDevice,
             'p' => self.popup = Popup::SelectPackage,
@@ -178,6 +210,10 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    fn toggle_focus(&mut self, panel: FocusedPanel) {
+        self.focused_panel = if self.focused_panel == panel { FocusedPanel::None } else { panel };
     }
 
     fn handle_package_search_key(&mut self, key: char) {
@@ -358,6 +394,8 @@ impl App {
         self.net_rx_history.clear();
         self.net_tx_history.clear();
         self.net_resync = true;
+        self.capture_rx_history.clear();
+        self.capture_tx_history.clear();
     }
 
     fn reset_device_data(&mut self) {
@@ -369,8 +407,85 @@ impl App {
         self.alarms_data = Default::default();
         self.jobs_data = Default::default();
         self.last_error = None;
+        self.capture = None;
         self.set_packages(Vec::new());
         self.reset_history();
+    }
+
+    pub fn on_capture(&mut self, snapshot: proto::Snapshot) {
+        let mut rates = HashMap::new();
+        if let Some(prev) = &self.capture {
+            let dt = snapshot.time_ms.saturating_sub(prev.snapshot.time_ms);
+            // A restarted capture starts counting from zero again.
+            if dt > 0 && snapshot.started_ms == prev.snapshot.started_ms {
+                for app in &snapshot.apps {
+                    let (prev_rx, prev_tx) = prev.snapshot.apps.iter()
+                        .find(|p| p.uid == app.uid)
+                        .map(|p| (p.rx_bytes, p.tx_bytes))
+                        .unwrap_or((0, 0));
+                    rates.insert(app.uid, (
+                        app.rx_bytes.saturating_sub(prev_rx) * 1000 / dt,
+                        app.tx_bytes.saturating_sub(prev_tx) * 1000 / dt,
+                    ));
+                }
+            }
+        }
+        let had_rates = !rates.is_empty();
+        self.capture = Some(CaptureState { snapshot, rates });
+        self.capture_error = None;
+        if had_rates {
+            let traffic = self.capture_traffic().unwrap_or_default();
+            push_history(&mut self.capture_rx_history, traffic.rx_rate);
+            push_history(&mut self.capture_tx_history, traffic.tx_rate);
+        }
+    }
+
+    /// The uids of the selected package (several apps can share one uid, listed as "a,b").
+    fn package_uids(&self, snapshot: &proto::Snapshot) -> Option<Vec<i32>> {
+        let package = self.package.as_deref()?;
+        Some(snapshot.apps.iter()
+            .filter(|a| a.name.split(',').any(|name| name == package))
+            .map(|a| a.uid)
+            .collect())
+    }
+
+    pub fn capture_traffic(&self) -> Option<CaptureTraffic> {
+        let capture = self.capture.as_ref()?;
+        let uids = self.package_uids(&capture.snapshot);
+        let mut traffic = CaptureTraffic::default();
+        for app in &capture.snapshot.apps {
+            if uids.as_ref().is_some_and(|u| !u.contains(&app.uid)) {
+                continue;
+            }
+            let (rx_rate, tx_rate) = capture.rates.get(&app.uid).copied().unwrap_or((0, 0));
+            traffic.rx_bytes += app.rx_bytes;
+            traffic.tx_bytes += app.tx_bytes;
+            traffic.rx_rate += rx_rate;
+            traffic.tx_rate += tx_rate;
+            traffic.open_connections += app.open_connections;
+        }
+        Some(traffic)
+    }
+
+    /// Connections of the selected package (or all), open ones first, most recent first.
+    pub fn capture_connections(&self) -> Vec<&proto::Connection> {
+        let Some(capture) = &self.capture else { return Vec::new() };
+        let uids = self.package_uids(&capture.snapshot);
+        let mut connections: Vec<&proto::Connection> = capture.snapshot.connections.iter()
+            .filter(|c| uids.as_ref().map_or(true, |u| u.contains(&c.uid)))
+            .collect();
+        let is_open = |c: &proto::Connection| {
+            c.state == proto::ConnectionState::Open as i32 || c.state == proto::ConnectionState::Connecting as i32
+        };
+        connections.sort_by(|a, b| is_open(b).cmp(&is_open(a)).then(b.last_ms.cmp(&a.last_ms)));
+        connections
+    }
+
+    pub fn capture_app_name(&self, uid: i32) -> &str {
+        self.capture.as_ref()
+            .and_then(|c| c.snapshot.apps.iter().find(|a| a.uid == uid))
+            .map(|a| a.name.as_str())
+            .unwrap_or("?")
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -460,6 +575,46 @@ mod tests {
         app.set_devices(vec![device("A")]);
         app.on_enter();
         assert_eq!(app.device_serial.as_deref(), Some("A"));
+    }
+
+    #[tokio::test]
+    async fn capture_rates_and_connections_follow_the_selected_package() {
+        let snapshots = crate::agent::tests::golden_snapshots().await;
+        let mut app = App::new(Some("com.example.app".into()), None);
+        for snapshot in snapshots.clone() {
+            app.on_capture(snapshot);
+        }
+
+        let traffic = app.capture_traffic().unwrap();
+        assert_eq!(traffic.rx_rate, 15_000);
+        assert_eq!(traffic.tx_rate, 500);
+        assert_eq!(traffic.rx_bytes, 75_000);
+        assert_eq!(app.capture_rx_history, vec![15_000; 4]);
+
+        let hosts: Vec<&str> = app.capture_connections().iter().map(|c| c.host.as_str()).collect();
+        assert_eq!(hosts, vec!["www.example.com", "api.example.com"]);
+
+        // Device mode shows every app.
+        let mut device = App::new(None, None);
+        for snapshot in snapshots {
+            device.on_capture(snapshot);
+        }
+        assert_eq!(device.capture_connections().len(), 3);
+        assert_eq!(device.capture_traffic().unwrap().rx_rate, 15_100);
+        assert_eq!(device.capture_app_name(10200), "com.other.app");
+    }
+
+    #[test]
+    fn capture_and_connections_keys() {
+        let mut app = App::new(None, None);
+        assert!(!app.on_key('c'));
+        assert!(app.capture_wanted);
+        app.on_key('n');
+        assert_eq!(app.focused_panel, FocusedPanel::Connections);
+        app.on_key('f');
+        assert_eq!(app.focused_panel, FocusedPanel::Threads);
+        app.on_key('f');
+        assert_eq!(app.focused_panel, FocusedPanel::None);
     }
 
     #[test]

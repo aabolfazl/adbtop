@@ -93,6 +93,7 @@ fn draw_monitor_tab(frame: &mut Frame, app: &App, area: Rect) {
     if app.focused_panel != FocusedPanel::None {
         match app.focused_panel {
             FocusedPanel::Threads => draw_threads_fullscreen(frame, app, area),
+            FocusedPanel::Connections => draw_connections_fullscreen(frame, app, area),
             FocusedPanel::None => draw_monitor_panels(frame, app, area),
         }
         return;
@@ -143,6 +144,14 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" | ", Style::default().fg(FG_DIM)),
         Span::styled(format!("Bat {}%", app.metrics.battery_level), Style::default().fg(GREEN)),
     ];
+
+    if app.capture.is_some() {
+        spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
+        spans.push(Span::styled("CAPTURE", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)));
+    } else if app.capture_wanted {
+        spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
+        spans.push(Span::styled("CAPTURE...", Style::default().fg(YELLOW)));
+    }
 
     if app.package.is_some() && app.metrics.threads.is_empty() {
         spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
@@ -405,27 +414,28 @@ fn draw_thermal_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_network_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = styled_block("Network");
+    // With the capture agent running, an app's own traffic is known; otherwise only the device's.
+    let app_traffic = if app.package.is_some() { app.capture_traffic() } else { None };
+    let block = styled_block(if app_traffic.is_some() { "Network (app)" } else { "Network" });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 { return; }
 
-    let net = &app.network_data;
-
-    let format_bytes = |b: u64| -> String {
-        if b > 1_000_000_000 { format!("{:.1}G", b as f64 / 1_000_000_000.0) }
-        else if b > 1_000_000 { format!("{:.1}M", b as f64 / 1_000_000.0) }
-        else if b > 1_000 { format!("{:.1}K", b as f64 / 1_000.0) }
-        else { format!("{}B", b) }
-    };
-
     let text_lines: usize = 2;
-    let wifi_icon = if net.wifi_connected { "\u{25CF}" } else { "\u{25CB}" };
-    let mobile_icon = if net.mobile_connected { "\u{25CF}" } else { "\u{25CB}" };
-    let stats = [
-        (format!("{} Wi \u{2193}{} \u{2191}{}", wifi_icon, format_bytes(net.wifi_rx_bytes), format_bytes(net.wifi_tx_bytes)), if net.wifi_connected { AQUA } else { FG_DIM }),
-        (format!("{} Mo \u{2193}{} \u{2191}{}", mobile_icon, format_bytes(net.mobile_rx_bytes), format_bytes(net.mobile_tx_bytes)), if net.mobile_connected { PURPLE } else { FG_DIM }),
-    ];
+    let stats = if let Some(t) = app_traffic {
+        [
+            (format!("\u{2193} {}/s  {}", format_bytes(t.rx_rate), format_bytes(t.rx_bytes)), AQUA),
+            (format!("\u{2191} {}/s  {}", format_bytes(t.tx_rate), format_bytes(t.tx_bytes)), PURPLE),
+        ]
+    } else {
+        let net = &app.network_data;
+        let wifi_icon = if net.wifi_connected { "\u{25CF}" } else { "\u{25CB}" };
+        let mobile_icon = if net.mobile_connected { "\u{25CF}" } else { "\u{25CB}" };
+        [
+            (format!("{} Wi \u{2193}{} \u{2191}{}", wifi_icon, format_bytes(net.wifi_rx_bytes), format_bytes(net.wifi_tx_bytes)), if net.wifi_connected { AQUA } else { FG_DIM }),
+            (format!("{} Mo \u{2193}{} \u{2191}{}", mobile_icon, format_bytes(net.mobile_rx_bytes), format_bytes(net.mobile_tx_bytes)), if net.mobile_connected { PURPLE } else { FG_DIM }),
+        ]
+    };
     for (i, (value, color)) in stats.iter().enumerate() {
         if (i as u16) < inner.height {
             frame.render_widget(
@@ -435,22 +445,120 @@ fn draw_network_panel(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    let history = if app_traffic.is_some() { &app.capture_rx_history } else { &app.net_rx_history };
     let sparkline_height = (inner.height as usize).saturating_sub(text_lines);
-    if sparkline_height > 0 && !app.net_rx_history.is_empty() {
+    if sparkline_height > 0 && !history.is_empty() {
         let spark_area = Rect::new(
             inner.x,
             inner.y + text_lines as u16,
             inner.width,
             sparkline_height as u16,
         );
-        let max_val = app.net_rx_history.iter().copied().max().unwrap_or(1).max(1);
+        let max_val = history.iter().copied().max().unwrap_or(1).max(1);
         frame.render_widget(
             Sparkline::default()
-                .data(&app.net_rx_history)
+                .data(history)
                 .max(max_val)
                 .style(Style::default().fg(AQUA)),
             spark_area,
         );
+    }
+}
+
+fn format_bytes(b: u64) -> String {
+    if b > 1_000_000_000 { format!("{:.1}G", b as f64 / 1_000_000_000.0) }
+    else if b > 1_000_000 { format!("{:.1}M", b as f64 / 1_000_000.0) }
+    else if b > 1_000 { format!("{:.1}K", b as f64 / 1_000.0) }
+    else { format!("{}B", b) }
+}
+
+fn format_age(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 { format!("{}s", secs) } else if secs < 3600 { format!("{}m", secs / 60) } else { format!("{}h", secs / 3600) }
+}
+
+fn format_ip(bytes: &[u8]) -> String {
+    match bytes.len() {
+        4 => std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string(),
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(bytes);
+            std::net::Ipv6Addr::from(octets).to_string()
+        }
+        _ => "?".to_string(),
+    }
+}
+
+/// Every connection the agent saw (for the selected package, if any), like a live netstat.
+fn draw_connections_fullscreen(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::agent::proto::{ConnectionState, Protocol};
+
+    let connections = app.capture_connections();
+    let title = format!("Connections [{}] [n] exit fullscreen", connections.len());
+    let block = styled_block(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 3 || inner.width == 0 { return; }
+
+    let Some(capture) = &app.capture else {
+        let message = if app.capture_wanted {
+            "Waiting for the capture agent on the phone (accept the VPN request there the first time)..."
+        } else {
+            "Capture is off. Press c to start it; it needs the agent app from android-agent/ on the phone."
+        };
+        frame.render_widget(Paragraph::new(message).style(Style::default().fg(FG_DIM)), inner);
+        return;
+    };
+
+    let traffic = app.capture_traffic().unwrap_or_default();
+    let stats = capture.snapshot.stats.unwrap_or_default();
+    let summary = format!(
+        " \u{2193} {} ({}/s)  \u{2191} {} ({}/s)  open {}  |  device: TCP {}, UDP {}, DNS lookups {}  |  agent {}",
+        format_bytes(traffic.rx_bytes), format_bytes(traffic.rx_rate),
+        format_bytes(traffic.tx_bytes), format_bytes(traffic.tx_rate),
+        traffic.open_connections, stats.open_tcp, stats.open_udp,
+        capture.snapshot.dns.len(), capture.snapshot.agent_version,
+    );
+    frame.render_widget(Paragraph::new(summary).style(Style::default().fg(AQUA)), Rect::new(inner.x, inner.y, inner.width, 1));
+
+    let show_app = app.package.is_none();
+    let header = if show_app {
+        " PROTO STATE     \u{2193} RX     \u{2191} TX    AGE  APP                     HOST"
+    } else {
+        " PROTO STATE     \u{2193} RX     \u{2191} TX    AGE  HOST"
+    };
+    frame.render_widget(Paragraph::new(header).style(Style::default().fg(FG_DIM)), Rect::new(inner.x, inner.y + 1, inner.width, 1));
+
+    let now = capture.snapshot.time_ms;
+    let visible_rows = (inner.height as usize).saturating_sub(2);
+    for (i, c) in connections.iter().take(visible_rows).enumerate() {
+        let y = inner.y + 2 + i as u16;
+        let proto = if c.protocol == Protocol::Udp as i32 { "udp" } else { "tcp" };
+        let (state, color) = match ConnectionState::try_from(c.state).unwrap_or(ConnectionState::StateUnknown) {
+            ConnectionState::Open => ("open", GREEN),
+            ConnectionState::Connecting => ("conn", YELLOW),
+            ConnectionState::Failed => ("failed", RED),
+            _ => ("closed", FG_DIM),
+        };
+        let mut host = if c.host.is_empty() { format_ip(&c.remote_ip) } else { c.host.clone() };
+        host.push_str(&format!(":{}", c.remote_port));
+        if !c.error.is_empty() {
+            host.push_str(&format!("  ({})", c.error));
+        }
+
+        let mut spans = vec![
+            Span::styled(format!(" {:<6}", proto), Style::default().fg(FG_DIM)),
+            Span::styled(format!("{:<7}", state), Style::default().fg(color)),
+            Span::styled(format!("{:>8} ", format_bytes(c.rx_bytes)), Style::default().fg(AQUA)),
+            Span::styled(format!("{:>8} ", format_bytes(c.tx_bytes)), Style::default().fg(PURPLE)),
+            Span::styled(format!("{:>5}  ", format_age(now.saturating_sub(c.start_ms))), Style::default().fg(FG_DIM)),
+        ];
+        if show_app {
+            spans.push(Span::styled(format!("{:<24}", truncate_str(app.capture_app_name(c.uid), 23)), Style::default().fg(BLUE)));
+        }
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        spans.push(Span::styled(truncate_str(&host, (inner.width as usize).saturating_sub(used)), Style::default().fg(FG)));
+        frame.render_widget(Paragraph::new(Line::from(spans)), Rect::new(inner.x, y, inner.width, 1));
     }
 }
 
@@ -658,13 +766,13 @@ fn draw_threads_fullscreen(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let shortcuts = "q:quit  space:pause  d:device  p:package  x:clear pkg  f:fullscreen";
+    let shortcuts = "q:quit  space:pause  d:device  p:package  x:clear pkg  f:threads  n:connections  c:capture";
 
     let mut spans = vec![
         Span::styled(format!(" {} ", shortcuts), Style::default().fg(FG_DIM)),
     ];
 
-    if let Some(msg) = app.last_error.as_ref().or(app.recorder_error.as_ref()) {
+    if let Some(msg) = app.last_error.as_ref().or(app.capture_error.as_ref()).or(app.recorder_error.as_ref()) {
         spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
         spans.push(Span::styled(msg.as_str(), Style::default().fg(RED)));
     }

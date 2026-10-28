@@ -13,6 +13,7 @@ A fast, btop-style terminal UI for monitoring Android device and per-app perform
 - **Battery & Power** — level, charging state, deep and light doze state, app standby bucket
 - **Thermal** — AP, SKIN, and battery temperatures with history
 - **Network** — device-wide Wi-Fi / mobile RX / TX with a sparkline
+- **Network capture** (optional [agent app](android-agent/README.md), no root) — each app's traffic, every connection with its domain name, DNS lookups, and a pcap file for Wireshark
 - **Jobs & Alarms** — scheduled jobs and pending alarms for the selected app
 - **Device mode** — monitor the whole device, or switch to a specific package
 - **CSV recording** — one row per sample with `--output`
@@ -56,6 +57,8 @@ The binary will be at `target/release/android-perf-monitor`.
 | `-p`, `--package <NAME>`  | Package to track | device-wide |
 | `-i`, `--interval <SECS>` | Sample interval in seconds (jobs and alarms use twice this) | `1` |
 | `-o`, `--output <PATH>`   | Write one CSV row per sample | none |
+| `--capture`               | Start the network capture agent on the phone | off |
+| `--pcap <FILE>`           | Save every captured packet for Wireshark (implies `--capture`) | none |
 
 The CSV columns are `timestamp, device, package, sys_cpu_pct, app_cpu_pct, mem_used_mb, app_pss_mb, battery_pct, battery_temp_c, cpu_temp_c, skin_temp_c, net_rx_bytes, net_tx_bytes`. App columns are empty in device-wide mode.
 
@@ -69,6 +72,8 @@ The CSV columns are `timestamp, device, package, sys_cpu_pct, app_cpu_pct, mem_u
 | `p` | Open package picker (type to filter) |
 | `x` | Clear package selection (device-wide mode) |
 | `f` | Toggle fullscreen on the threads panel |
+| `c` | Start / stop the network capture |
+| `n` | Toggle fullscreen connections view (needs the capture) |
 | `↑` / `↓` | Navigate lists |
 | `Enter` | Select |
 
@@ -81,6 +86,8 @@ The CSV columns are `timestamp, device, package, sys_cpu_pct, app_cpu_pct, mem_u
 ## How it works
 
 Each device gets one persistent `adb shell` session that streams metrics from `/proc`, `dumpsys`, and `top`; picking another device restarts it for the new serial. Each panel has its own async collector that pushes updates over an `mpsc` channel to the UI thread, which redraws at ~60fps using double-buffered `ratatui`. A debug log is written to `android-perf-monitor.log` in the current directory.
+
+For network capture, the [agent app](android-agent/README.md) runs a local VPN on the phone and streams protobuf snapshots ([`proto/agent.proto`](proto/agent.proto)) over `adb forward`.
 
 ## License
 
