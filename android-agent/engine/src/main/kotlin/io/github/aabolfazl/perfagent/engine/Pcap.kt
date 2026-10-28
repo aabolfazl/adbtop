@@ -52,6 +52,8 @@ object Pcap {
 class PcapStream(
     private val out: OutputStream,
     private val maxQueuedBytes: Long = 8L * 1024 * 1024,
+    /** Called on the writer thread once the stream has ended for any reason. */
+    private val onClosed: (PcapStream) -> Unit = {},
 ) : PacketTap, Closeable {
     private val queue = LinkedBlockingQueue<ByteArray>()
     private val queuedBytes = AtomicLong()
@@ -98,6 +100,7 @@ class PcapStream(
             open = false
             queue.clear()
             runCatching { out.close() }
+            onClosed(this)
         }
     }
 
