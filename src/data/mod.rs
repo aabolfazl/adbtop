@@ -37,7 +37,7 @@ pub struct ThreadInfo {
     pub pid: u32,
     pub name: String,
     pub cpu_percent: f32,
-    pub mem_percent: f32,
+    pub mem_percent: Option<f32>,
     pub core: Option<u8>,
     pub time: String,
 }

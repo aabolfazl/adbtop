@@ -283,15 +283,12 @@ fn draw_sparklines_row(frame: &mut Frame, app: &App, area: Rect) {
     let block = styled_block("Mem %");
     let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
-    let mem = &app.memory_data;
-    let mem_pct = if mem.total_kb > 0 {
-        ((mem.total_kb - mem.available_kb) as f32 / mem.total_kb as f32 * 100.0) as u64
-    } else { 0 };
-    let mem_data = vec![mem_pct; 1];
-    frame.render_widget(
-        Sparkline::default().data(&mem_data).max(100).style(Style::default().fg(PURPLE)),
-        inner
-    );
+    if !app.mem_history.is_empty() {
+        frame.render_widget(
+            Sparkline::default().data(&app.mem_history).max(100).style(Style::default().fg(PURPLE)),
+            inner
+        );
+    }
 
     let block = styled_block("Temp");
     let inner = block.inner(chunks[2]);
@@ -343,13 +340,13 @@ fn draw_memory_panel(frame: &mut Frame, app: &App, area: Rect) {
         );
     } else {
         let total_mb = mem.total_kb / 1024;
-        let used_mb = (mem.total_kb - mem.available_kb) / 1024;
+        let used_mb = mem.total_kb.saturating_sub(mem.available_kb) / 1024;
         let used_pct = if mem.total_kb > 0 { (used_mb as f32 / total_mb as f32) * 100.0 } else { 0.0 };
 
         let stats = [
             ("Used", format!("{:5} MB ({:.0}%)", used_mb, used_pct), usage_color(used_pct)),
             ("Free", format!("{:5} MB", mem.available_kb / 1024), GREEN),
-            ("Swap", format!("{:5} MB", (mem.swap_total_kb - mem.swap_free_kb) / 1024), PURPLE),
+            ("Swap", format!("{:5} MB", mem.swap_total_kb.saturating_sub(mem.swap_free_kb) / 1024), PURPLE),
         ];
 
         for (i, (label, value, color)) in stats.iter().enumerate() {
@@ -423,33 +420,18 @@ fn draw_network_panel(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let text_lines: usize = 2;
-    if app.package.is_some() && (net.app_rx_bytes > 0 || net.app_tx_bytes > 0) {
-        let stats = [
-            (format!("RX {}", format_bytes(net.app_rx_bytes)), AQUA),
-            (format!("TX {}", format_bytes(net.app_tx_bytes)), PURPLE),
-        ];
-        for (i, (value, color)) in stats.iter().enumerate() {
-            if (i as u16) < inner.height {
-                frame.render_widget(
-                    Paragraph::new(value.as_str()).style(Style::default().fg(*color)),
-                    Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
-                );
-            }
-        }
-    } else {
-        let wifi_icon = if net.wifi_connected { "\u{25CF}" } else { "\u{25CB}" };
-        let mobile_icon = if net.mobile_connected { "\u{25CF}" } else { "\u{25CB}" };
-        let stats = [
-            (format!("{} Wi \u{2193}{} \u{2191}{}", wifi_icon, format_bytes(net.wifi_rx_bytes), format_bytes(net.wifi_tx_bytes)), if net.wifi_connected { AQUA } else { FG_DIM }),
-            (format!("{} Mo \u{2193}{} \u{2191}{}", mobile_icon, format_bytes(net.mobile_rx_bytes), format_bytes(net.mobile_tx_bytes)), if net.mobile_connected { PURPLE } else { FG_DIM }),
-        ];
-        for (i, (value, color)) in stats.iter().enumerate() {
-            if (i as u16) < inner.height {
-                frame.render_widget(
-                    Paragraph::new(value.as_str()).style(Style::default().fg(*color)),
-                    Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
-                );
-            }
+    let wifi_icon = if net.wifi_connected { "\u{25CF}" } else { "\u{25CB}" };
+    let mobile_icon = if net.mobile_connected { "\u{25CF}" } else { "\u{25CB}" };
+    let stats = [
+        (format!("{} Wi \u{2193}{} \u{2191}{}", wifi_icon, format_bytes(net.wifi_rx_bytes), format_bytes(net.wifi_tx_bytes)), if net.wifi_connected { AQUA } else { FG_DIM }),
+        (format!("{} Mo \u{2193}{} \u{2191}{}", mobile_icon, format_bytes(net.mobile_rx_bytes), format_bytes(net.mobile_tx_bytes)), if net.mobile_connected { PURPLE } else { FG_DIM }),
+    ];
+    for (i, (value, color)) in stats.iter().enumerate() {
+        if (i as u16) < inner.height {
+            frame.render_widget(
+                Paragraph::new(value.as_str()).style(Style::default().fg(*color)),
+                Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            );
         }
     }
 
@@ -478,7 +460,7 @@ fn draw_doze_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 
     let doze = &app.doze_data;
-    let idle_color = if doze.device_idle_state == "ACTIVE" { GREEN } else { YELLOW };
+    let idle_color = |state: &str| if state == "ACTIVE" { GREEN } else { YELLOW };
     let bucket_color = match doze.app_standby_bucket.as_str() {
         "ACTIVE" => GREEN,
         "WORKING_SET" => AQUA,
@@ -487,10 +469,13 @@ fn draw_doze_panel(frame: &mut Frame, app: &App, area: Rect) {
         _ => FG_DIM,
     };
 
-    let stats = [
-        (format!("Idle: {}", doze.device_idle_state), idle_color),
-        (format!("Bucket: {}", doze.app_standby_bucket), bucket_color),
+    let mut stats = vec![
+        (format!("Deep:  {}", doze.device_idle_state), idle_color(&doze.device_idle_state)),
+        (format!("Light: {}", doze.light_idle_state), idle_color(&doze.light_idle_state)),
     ];
+    if app.package.is_some() {
+        stats.push((format!("Bucket: {}", doze.app_standby_bucket), bucket_color));
+    }
 
     for (i, (value, color)) in stats.iter().enumerate() {
         if (i as u16) < inner.height {
@@ -618,7 +603,11 @@ fn draw_threads_compact(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
     if inner.height == 0 { return; }
 
-    let header = " PID     CPU   MEM   TIME       NAME";
+    let header = if app.package.is_some() {
+        " TID     CPU   CORE TIME       NAME"
+    } else {
+        " PID     CPU   MEM   TIME       NAME"
+    };
     frame.render_widget(Paragraph::new(header).style(Style::default().fg(FG_DIM)), Rect::new(inner.x, inner.y, inner.width, 1));
 
     let visible_rows = (inner.height as usize).saturating_sub(1);
@@ -629,7 +618,7 @@ fn draw_threads_compact(frame: &mut Frame, app: &App, area: Rect) {
         let line = Line::from(vec![
             Span::styled(format!(" {:<7}", thread.pid), Style::default().fg(FG_DIM)),
             Span::styled(format!("{:5.1}%", thread.cpu_percent), Style::default().fg(usage_color(thread.cpu_percent))),
-            Span::styled(format!("{:5.1}%", thread.mem_percent), Style::default().fg(PURPLE)),
+            Span::styled(format!("{:>6}", thread_mem_or_core(thread)), Style::default().fg(PURPLE)),
             Span::styled(format!(" {:<10}", thread.time), Style::default().fg(FG_DIM)),
             Span::styled(truncate_str(&thread.name, (inner.width as usize).saturating_sub(32)), Style::default().fg(FG)),
         ]);
@@ -645,7 +634,11 @@ fn draw_threads_fullscreen(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
     if inner.height == 0 { return; }
 
-    let header = " PID       CPU%    MEM%    TIME         NAME";
+    let header = if app.package.is_some() {
+        " TID       CPU%    CORE    TIME         NAME"
+    } else {
+        " PID       CPU%    MEM%    TIME         NAME"
+    };
     frame.render_widget(Paragraph::new(header).style(Style::default().fg(FG_DIM)), Rect::new(inner.x, inner.y, inner.width, 1));
 
     let visible_rows = (inner.height as usize).saturating_sub(1);
@@ -656,7 +649,7 @@ fn draw_threads_fullscreen(frame: &mut Frame, app: &App, area: Rect) {
         let line = Line::from(vec![
             Span::styled(format!(" {:<9}", thread.pid), Style::default().fg(FG_DIM)),
             Span::styled(format!("{:6.1}%  ", thread.cpu_percent), Style::default().fg(usage_color(thread.cpu_percent))),
-            Span::styled(format!("{:6.1}%  ", thread.mem_percent), Style::default().fg(PURPLE)),
+            Span::styled(format!("{:>7}  ", thread_mem_or_core(thread)), Style::default().fg(PURPLE)),
             Span::styled(format!("{:<12} ", thread.time), Style::default().fg(FG_DIM)),
             Span::styled(&thread.name, Style::default().fg(FG)),
         ]);
@@ -671,10 +664,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!(" {} ", shortcuts), Style::default().fg(FG_DIM)),
     ];
 
-    if let Some(ref msg) = app.status_message {
+    if let Some(msg) = app.last_error.as_ref().or(app.recorder_error.as_ref()) {
         spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
-        let msg_color = if msg.starts_with("Error") { RED } else { GREEN };
-        spans.push(Span::styled(msg.as_str(), Style::default().fg(msg_color)));
+        spans.push(Span::styled(msg.as_str(), Style::default().fg(RED)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -739,8 +731,9 @@ fn draw_package_popup(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let visible = (list_area.height as usize).min(20);
-    let items: Vec<ListItem> = app.filtered_packages.iter().take(visible).enumerate().map(|(i, &idx)| {
+    let visible = (list_area.height as usize).max(1);
+    let offset = (app.selected_package + 1).saturating_sub(visible);
+    let items: Vec<ListItem> = app.filtered_packages.iter().enumerate().skip(offset).take(visible).map(|(i, &idx)| {
         let pkg = &app.packages[idx];
         let style = if i == app.selected_package { Style::default().fg(GREEN).add_modifier(Modifier::BOLD) } else { Style::default().fg(FG_DIM) };
         ListItem::new(format!("{}{}", if i == app.selected_package { "> " } else { "  " }, pkg)).style(style)
@@ -757,8 +750,22 @@ fn temp_color(temp: f32) -> Color {
     if temp > 45.0 { RED } else if temp > 38.0 { ORANGE } else { GREEN }
 }
 
+fn thread_mem_or_core(thread: &crate::data::ThreadInfo) -> String {
+    match (thread.mem_percent, thread.core) {
+        (Some(mem), _) => format!("{:.1}%", mem),
+        (None, Some(core)) => core.to_string(),
+        (None, None) => "-".to_string(),
+    }
+}
+
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else if max > 3 { format!("{}...", &s[..max-3]) } else { s[..max].to_string() }
+    if s.chars().count() <= max {
+        s.to_string()
+    } else if max > 3 {
+        format!("{}...", s.chars().take(max - 3).collect::<String>())
+    } else {
+        s.chars().take(max).collect()
+    }
 }
 
 fn centered_rect(px: u16, py: u16, r: Rect) -> Rect {
@@ -768,4 +775,16 @@ fn centered_rect(px: u16, py: u16, r: Rect) -> Rect {
     Layout::default().direction(Direction::Horizontal)
         .constraints([Constraint::Percentage((100-px)/2), Constraint::Percentage(px), Constraint::Percentage((100-px)/2)])
         .split(v[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_str;
+
+    #[test]
+    fn truncate_handles_multibyte_names() {
+        assert_eq!(truncate_str("ابراهیم-thread", 6), "ابر...");
+        assert_eq!(truncate_str("名前", 1), "名");
+        assert_eq!(truncate_str("main", 10), "main");
+    }
 }
