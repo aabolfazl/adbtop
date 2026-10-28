@@ -25,3 +25,10 @@ Desktop.ini
 
 # Output artifacts
 *.csv
+
+# Android agent (Gradle)
+android-agent/.gradle/
+android-agent/**/.gradle/
+android-agent/**/build/
+android-agent/**/.kotlin/
+android-agent/local.properties

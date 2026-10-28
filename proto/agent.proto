@@ -1,0 +1,93 @@
+// Wire format between the on-device agent (android-agent/) and the terminal UI.
+//
+// The agent listens on the abstract unix socket "android-perf-agent" and sends one
+// length-delimited Snapshot (varint size prefix, then the message) every second.
+syntax = "proto3";
+
+package perfagent;
+
+option java_package = "io.github.aabolfazl.perfagent.proto";
+option java_multiple_files = true;
+
+message Snapshot {
+  string agent_version = 1;
+  uint64 time_ms = 2;
+  // When the capture started, in the same clock as time_ms.
+  uint64 started_ms = 3;
+  // Package the capture is limited to; empty when every app is captured.
+  string app_filter = 4;
+  repeated AppTraffic apps = 5;
+  // Open connections plus the most recently closed ones.
+  repeated Connection connections = 6;
+  repeated DnsQuery dns = 7;
+  CaptureStats stats = 8;
+}
+
+message AppTraffic {
+  int32 uid = 1;
+  string name = 2;
+  // Bytes of IP packets since the capture started; rx is network -> app.
+  uint64 rx_bytes = 3;
+  uint64 tx_bytes = 4;
+  uint32 open_connections = 5;
+}
+
+enum Protocol {
+  PROTOCOL_UNKNOWN = 0;
+  TCP = 1;
+  UDP = 2;
+}
+
+enum ConnectionState {
+  STATE_UNKNOWN = 0;
+  CONNECTING = 1;
+  OPEN = 2;
+  CLOSED = 3;
+  FAILED = 4;
+}
+
+enum HostSource {
+  HOST_NONE = 0;
+  DNS = 1;
+  TLS_SNI = 2;
+  HTTP_HOST = 3;
+}
+
+message Connection {
+  uint64 id = 1;
+  Protocol protocol = 2;
+  int32 uid = 3;
+  // 4 bytes for IPv4.
+  bytes remote_ip = 4;
+  uint32 remote_port = 5;
+  uint32 local_port = 6;
+  string host = 7;
+  HostSource host_source = 8;
+  uint64 rx_bytes = 9;
+  uint64 tx_bytes = 10;
+  uint64 rx_packets = 11;
+  uint64 tx_packets = 12;
+  uint64 start_ms = 13;
+  uint64 last_ms = 14;
+  ConnectionState state = 15;
+  // Why a connection failed or was reset, e.g. "Connection refused".
+  string error = 16;
+}
+
+message DnsQuery {
+  uint64 time_ms = 1;
+  int32 uid = 2;
+  string name = 3;
+  // Resolved addresses, 4 or 16 bytes each.
+  repeated bytes addresses = 4;
+  bool failed = 5;
+}
+
+message CaptureStats {
+  uint64 packets_from_apps = 1;
+  uint64 packets_to_apps = 2;
+  // Packets the agent can't forward (ICMP, IP fragments, ...).
+  uint64 unsupported_packets = 3;
+  uint32 open_tcp = 4;
+  uint32 open_udp = 5;
+}
