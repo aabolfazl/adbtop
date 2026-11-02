@@ -34,7 +34,7 @@ android-perf-monitor --capture -p com.example.app
 android-perf-monitor --pcap capture.pcap      # also save every packet for Wireshark
 ```
 
-Or press `c` to start and stop the capture, and `n` for the connections view. The first time,
+Or press `c` to start and stop the capture, and `5` for the Network page. The first time,
 the phone asks for VPN permission; accept it once. The capture stops when the monitor quits.
 
 ## Use it by hand
@@ -48,6 +48,8 @@ adb shell am start -n io.github.aabolfazl.perfagent/.ControlActivity --es cmd st
 adb forward tcp:5555 localabstract:android-perf-agent-pcap
 nc localhost 5555 | wireshark -k -i -
 ```
+
+`--ei idle_stop N` makes the agent stop itself once no client has been connected to the snapshot socket for N seconds. The monitor always passes `--ei idle_stop 30`, so a monitor that was killed or lost its cable does not leave the VPN running.
 
 The snapshot stream is on `localabstract:android-perf-agent`: length-delimited protobuf
 `Snapshot` messages, defined in [`../proto/agent.proto`](../proto/agent.proto). Only adb (the

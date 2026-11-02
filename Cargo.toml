@@ -3,7 +3,7 @@ name = "android-perf-monitor"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
-description = "Android performance monitoring TUI (btop-style)"
+description = "Android performance monitor: an interactive TUI, plus headless recording with JSON reports for scripts, CI and AI agents"
 authors = ["Abolfazl Abbasi"]
 license = "MIT"
 
@@ -16,15 +16,18 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prost = "0.14"
+serde_json = "1"
+toml = "0.8"
+unicode-width = "0.2"
 
 [build-dependencies]
 prost-build = "0.14"
-# Compiles proto/agent.proto in Rust, so building doesn't need protoc installed.
 protox = "0.9"
 
 [profile.release]
 opt-level = 3
 lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

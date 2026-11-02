@@ -1,898 +1,1053 @@
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Sparkline},
-    Frame,
-};
+mod pages;
+pub mod widgets;
 
-use crate::app::{App, FocusedPanel, Popup, Tab};
+use ratatui::layout::Rect;
+use ratatui::Frame;
 
-const BG: Color = Color::Rgb(40, 40, 40);
-const BG_HIGHLIGHT: Color = Color::Rgb(60, 56, 54);
-const FG: Color = Color::Rgb(235, 219, 178);
-const FG_DIM: Color = Color::Rgb(146, 131, 116);
-const RED: Color = Color::Rgb(251, 73, 52);
-const GREEN: Color = Color::Rgb(184, 187, 38);
-const YELLOW: Color = Color::Rgb(250, 189, 47);
-const BLUE: Color = Color::Rgb(131, 165, 152);
-const PURPLE: Color = Color::Rgb(211, 134, 155);
-const AQUA: Color = Color::Rgb(142, 192, 124);
-const ORANGE: Color = Color::Rgb(254, 128, 25);
+use crate::model::{thermal_level_name, AppState, Source, Support};
+use crate::session::Series;
+use crate::tui::{settings_rows, App, Popup, PAGES};
+use widgets::*;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(10),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    draw_tab_bar(frame, app, main_chunks[0]);
-
-    match app.current_tab {
-        Tab::Monitor => draw_monitor_tab(frame, app, main_chunks[1]),
+    let t = app.t();
+    let mut pen = Pen {
+        buf: frame.buffer_mut(),
+        t,
+        braille: app.braille(),
+    };
+    pen.clear(area);
+    if area.width < 80 || area.height < 24 {
+        pen.note(
+            area,
+            &format!(
+                "terminal is {}×{}; make it at least 80×24",
+                area.width, area.height
+            ),
+            t.yellow,
+        );
+        return;
     }
-
-    draw_footer(frame, app, main_chunks[2]);
-
-    match &app.popup {
-        Popup::SelectDevice => draw_device_popup(frame, app),
-        Popup::SelectPackage => draw_package_popup(frame, app),
+    tab_bar(&mut pen, app, Rect::new(area.x, area.y, area.width, 1));
+    status_bar(&mut pen, app, Rect::new(area.x, area.y + 1, area.width, 1));
+    footer(
+        &mut pen,
+        app,
+        Rect::new(area.x, area.bottom() - 1, area.width, 1),
+    );
+    let body = Rect::new(area.x, area.y + 2, area.width, area.height - 3);
+    if app.serial.is_none() {
+        let msg = if app.devices.iter().any(|d| d.state == "device") {
+            "Pick a device with d"
+        } else if app.devices.is_empty() {
+            "Waiting for an Android device (adb devices)…"
+        } else {
+            "The device is not ready: unlock it and accept the USB debugging prompt"
+        };
+        pen.note(body, msg, t.dim);
+    } else {
+        match app.page {
+            0 => pages::overview(&mut pen, app, body),
+            1 => pages::cpu(&mut pen, app, body),
+            2 => pages::memory(&mut pen, app, body),
+            3 => pages::frames(&mut pen, app, body),
+            4 => pages::network(&mut pen, app, body),
+            _ => pages::power(&mut pen, app, body),
+        }
+    }
+    match app.popup {
+        Popup::Device => device_popup(&mut pen, app, area),
+        Popup::Package => package_popup(&mut pen, app, area),
+        Popup::Settings => settings_popup(&mut pen, app, area),
+        Popup::Marker => marker_popup(&mut pen, app, area),
+        Popup::Help => help_popup(&mut pen, app, area),
+        Popup::Actions => actions_popup(&mut pen, app, area),
+        Popup::Console => console_popup(&mut pen, app, area),
+        Popup::Prompt => {
+            if !app.console.title.is_empty() {
+                console_popup(&mut pen, app, area);
+            }
+            prompt(&mut pen, app, area);
+        }
         Popup::None => {}
     }
 }
 
-fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let tabs: Vec<Span> = Tab::all()
-        .iter()
-        .flat_map(|tab| {
-            let is_active = *tab == app.current_tab;
-            let style = if is_active {
-                Style::default().fg(BG).bg(YELLOW).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(FG_DIM)
-            };
-
-            vec![
-                Span::styled(format!(" {} ", tab.key()), Style::default().fg(if is_active { YELLOW } else { FG_DIM })),
-                Span::styled(format!("{} ", tab.name()), style),
-                Span::styled(" ", Style::default()),
-            ]
-        })
-        .collect();
-
-    let mut line_spans = vec![Span::styled(" ", Style::default())];
-    line_spans.extend(tabs);
-
-    let device_name = app.current_device()
-        .map(|d| d.model.as_str())
-        .unwrap_or("--");
-    let pkg_name = app.package.as_deref()
-        .map(|p| p.split('.').last().unwrap_or(p))
-        .unwrap_or("--");
-
-    line_spans.extend(vec![
-        Span::styled(" | ", Style::default().fg(FG_DIM)),
-        Span::styled(device_name, Style::default().fg(PURPLE)),
-        Span::styled(" | ", Style::default().fg(FG_DIM)),
-        Span::styled(pkg_name, Style::default().fg(AQUA)),
-    ]);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(line_spans)).style(Style::default().bg(BG_HIGHLIGHT)),
-        area,
+fn actions_popup(pen: &mut Pen, app: &App, area: Rect) {
+    let t = pen.t;
+    let items = crate::actions::menu(
+        &app.tweaks,
+        app.session.doze.as_ref().and_then(|d| d.bucket.as_deref()),
     );
-}
-
-fn draw_monitor_tab(frame: &mut Frame, app: &App, area: Rect) {
-    if app.focused_panel != FocusedPanel::None {
-        match app.focused_panel {
-            FocusedPanel::Threads => draw_threads_fullscreen(frame, app, area),
-            FocusedPanel::Connections => draw_connections_fullscreen(frame, app, area),
-            FocusedPanel::None => draw_monitor_panels(frame, app, area),
+    let groups = items
+        .iter()
+        .map(|i| i.group)
+        .fold(Vec::new(), |mut v: Vec<&str>, g| {
+            if v.last() != Some(&g) {
+                v.push(g);
+            }
+            v
+        });
+    let r = centered(area, 92, (items.len() + groups.len() * 2 + 3) as u16);
+    pen.clear(r);
+    let target = app.package().unwrap_or("no app selected");
+    let inner = pen.panel(
+        r,
+        &[("Actions", t.yellow, true)],
+        &[(
+            target,
+            if app.package().is_some() {
+                t.aqua
+            } else {
+                t.dim
+            },
+            false,
+        )],
+        Some(t.yellow),
+    );
+    let mut y = inner.y;
+    let mut last_group = "";
+    for (i, item) in items.iter().enumerate() {
+        if item.group != last_group {
+            if !last_group.is_empty() {
+                y += 1;
+            }
+            pen.text(inner.x + 2, y, item.group, t.dim, true, inner.right());
+            y += 1;
+            last_group = item.group;
         }
-        return;
-    }
-
-    draw_monitor_panels(frame, app, area);
-}
-
-fn draw_monitor_panels(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(6),
-            Constraint::Length(4),
-            Constraint::Length(5),
-            Constraint::Min(6),
-        ])
-        .split(area);
-
-    draw_status_bar(frame, app, chunks[0]);
-    draw_cpu_stats_row(frame, app, chunks[1]);
-    draw_sparklines_row(frame, app, chunks[2]);
-    draw_memory_battery_doze_row(frame, app, chunks[3]);
-    draw_threads_jobs_network_row(frame, app, chunks[4]);
-}
-
-fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let elapsed = app.elapsed();
-    let status = if app.paused { "PAUSED" } else { "REC" };
-    let status_color = if app.paused { YELLOW } else { GREEN };
-
-    let (mode_text, mode_color) = match app.tracking_mode {
-        crate::runner::TrackingMode::Device => ("DEVICE", PURPLE),
-        crate::runner::TrackingMode::Package => ("PACKAGE", AQUA),
-    };
-
-    let mut spans = vec![
-        Span::styled(format!(" {} ", status), Style::default().fg(status_color)),
-        Span::styled(
-            format!("{}:{:02}", elapsed.as_secs() / 60, elapsed.as_secs() % 60),
-            Style::default().fg(FG),
-        ),
-        Span::styled(" | ", Style::default().fg(FG_DIM)),
-        Span::styled(format!("{}", mode_text), Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
-        Span::styled(" | ", Style::default().fg(FG_DIM)),
-        Span::styled(format!("#{}", app.sample_count), Style::default().fg(BLUE)),
-        Span::styled(" | ", Style::default().fg(FG_DIM)),
-        Span::styled(format!("Bat {}%", app.metrics.battery_level), Style::default().fg(GREEN)),
-    ];
-
-    if app.capture.is_some() {
-        spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
-        spans.push(Span::styled("CAPTURE", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)));
-    } else if app.capture_wanted {
-        spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
-        spans.push(Span::styled("CAPTURE...", Style::default().fg(YELLOW)));
-    }
-
-    if app.package.is_some() && app.metrics.threads.is_empty() {
-        spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
-        spans.push(Span::styled("NOT RUNNING", Style::default().fg(RED).add_modifier(Modifier::BOLD)));
-    }
-
-    let line = Line::from(spans);
-
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-fn styled_block(title: &str) -> Block<'_> {
-    Block::default()
-        .title(format!(" {} ", title))
-        .title_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(FG_DIM))
-}
-
-fn draw_cpu_stats_row(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-        .split(area);
-
-    draw_cpu_panel(frame, app, chunks[0]);
-    draw_stats_panel(frame, app, chunks[1]);
-}
-
-fn draw_cpu_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let title = if app.package.is_some() { "System CPU" } else { "CPU" };
-    let block = styled_block(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let num_cores = app.metrics.cpu_cores.len();
-    if num_cores == 0 || inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let min_col_width = 14u16;
-    let max_cols = (inner.width / min_col_width).max(1) as usize;
-
-    let rows_available = inner.height as usize;
-    let cols = ((num_cores + rows_available - 1) / rows_available).clamp(1, max_cols);
-
-    let col_width = inner.width / cols as u16;
-    if col_width == 0 {
-        return;
-    }
-
-    for (i, core) in app.metrics.cpu_cores.iter().enumerate() {
-        let col = i % cols;
-        let row = i / cols;
-        if row as u16 >= inner.height {
+        if y >= inner.bottom() {
             break;
         }
-
-        let x = inner.x + (col as u16 * col_width);
-        let y = inner.y + row as u16;
-
-        let color = usage_color(core.usage_percent);
-        let bar_chars = ((col_width as f32 - 14.0).max(0.0) * (core.usage_percent / 100.0)) as usize;
-        let empty_chars = ((col_width as f32 - 14.0).max(0.0) as usize).saturating_sub(bar_chars);
-
-        let line = Line::from(vec![
-            Span::styled(format!("{} ", core.id), Style::default().fg(FG_DIM)),
-            Span::styled("[", Style::default().fg(FG_DIM)),
-            Span::styled("|".repeat(bar_chars), Style::default().fg(color)),
-            Span::styled("|".repeat(empty_chars), Style::default().fg(Color::Rgb(60, 56, 54))),
-            Span::styled("]", Style::default().fg(FG_DIM)),
-            Span::styled(format!("{:3.0}%", core.usage_percent), Style::default().fg(color)),
-        ]);
-
-        frame.render_widget(Paragraph::new(line), Rect::new(x, y, col_width, 1));
-    }
-}
-
-fn draw_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = styled_block("Stats");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let num_cores = app.metrics.cpu_cores.len();
-    let total_cpu: f32 = if num_cores > 0 {
-        app.metrics.cpu_cores.iter().map(|c| c.usage_percent).sum::<f32>() / num_cores as f32
-    } else { 0.0 };
-    let avg_freq: u32 = if num_cores > 0 {
-        app.metrics.cpu_cores.iter().map(|c| c.frequency_mhz).sum::<u32>() / num_cores as u32
-    } else { 0 };
-
-    let stats = if app.package.is_some() {
-        vec![
-            ("APP", format!("{:5.1}%", app.metrics.app_cpu_total), usage_color(app.metrics.app_cpu_total)),
-            ("SYS", format!("{:5.1}%", total_cpu), usage_color(total_cpu)),
-            ("AVG", format!("{:5.1}%", app.metrics.app_cpu_avg), PURPLE),
-            ("FRQ", format!("{:4}M", avg_freq), BLUE),
-        ]
-    } else {
-        vec![
-            ("SYS", format!("{:5.1}%", total_cpu), usage_color(total_cpu)),
-            ("FRQ", format!("{:4}M", avg_freq), BLUE),
-        ]
-    };
-
-    for (i, (label, value, color)) in stats.iter().enumerate() {
-        if (i as u16) < inner.height {
-            let style = if i == 0 && app.package.is_some() {
-                Style::default().fg(*color).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(*color)
-            };
-            let line = Line::from(vec![
-                Span::styled(format!("{} ", label), Style::default().fg(FG_DIM)),
-                Span::styled(value, style),
-            ]);
-            frame.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.y + i as u16, inner.width, 1));
+        let enabled = !item.needs_app || app.package().is_some();
+        let sel = i == app.cursor;
+        if sel {
+            pen.fill(Rect::new(inner.x, y, inner.width, 1), t.sel);
         }
-    }
-}
-
-fn draw_sparklines_row(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
-        .split(area);
-
-    let cpu_label = if app.package.is_some() { "App CPU %" } else { "CPU %" };
-    let block = styled_block(cpu_label);
-    let inner = block.inner(chunks[0]);
-    frame.render_widget(block, chunks[0]);
-    if !app.cpu_history.is_empty() {
-        let data: Vec<u64> = app.cpu_history.iter().map(|v| (*v as u64).min(100)).collect();
-        frame.render_widget(Sparkline::default().data(&data).max(100).style(Style::default().fg(GREEN)), inner);
-    }
-
-    let block = styled_block("Mem %");
-    let inner = block.inner(chunks[1]);
-    frame.render_widget(block, chunks[1]);
-    if !app.mem_history.is_empty() {
-        frame.render_widget(
-            Sparkline::default().data(&app.mem_history).max(100).style(Style::default().fg(PURPLE)),
-            inner
+        let key = item.key.to_string();
+        pen.segs(
+            inner.x + 2,
+            y,
+            &[
+                (&key, if enabled { t.yellow } else { t.dim }, true),
+                ("   ", t.dim, false),
+                (
+                    &pad(&item.label, 32),
+                    if enabled { t.fg } else { t.dim },
+                    sel,
+                ),
+                (
+                    if enabled {
+                        item.detail
+                    } else {
+                        "pick an app with p first"
+                    },
+                    t.dim,
+                    false,
+                ),
+            ],
+            inner.right(),
         );
+        y += 1;
     }
-
-    let block = styled_block("Temp");
-    let inner = block.inner(chunks[2]);
-    frame.render_widget(block, chunks[2]);
-    if !app.temp_history.is_empty() {
-        let data: Vec<u64> = app.temp_history.iter().map(|v| *v as u64).collect();
-        frame.render_widget(Sparkline::default().data(&data).max(60).style(Style::default().fg(ORANGE)), inner);
-    }
-}
-
-fn draw_memory_battery_doze_row(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(35), Constraint::Percentage(30)])
-        .split(area);
-
-    draw_memory_panel(frame, app, chunks[0]);
-    draw_battery_panel(frame, app, chunks[1]);
-    draw_doze_panel(frame, app, chunks[2]);
-}
-
-fn draw_memory_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = styled_block("Memory");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mem = &app.memory_data;
-
-    if app.package.is_some() && mem.app_pss_kb > 0 {
-        let stats = [
-            ("PSS", format!("{:5} MB", mem.app_pss_kb / 1024), AQUA),
-            ("Heap", format!("{:5} MB", mem.app_heap_size_kb / 1024), PURPLE),
-            ("Alloc", format!("{:5} MB", mem.app_heap_alloc_kb / 1024), GREEN),
-        ];
-
-        for (i, (label, value, color)) in stats.iter().enumerate() {
-            if (i as u16) < inner.height {
-                let line = Line::from(vec![
-                    Span::styled(format!("{:<5}", label), Style::default().fg(FG_DIM)),
-                    Span::styled(value, Style::default().fg(*color)),
-                ]);
-                frame.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.y + i as u16, inner.width, 1));
-            }
-        }
-    } else if app.package.is_some() {
-        frame.render_widget(
-            Paragraph::new("Process not running").style(Style::default().fg(FG_DIM)),
-            inner
-        );
-    } else {
-        let total_mb = mem.total_kb / 1024;
-        let used_mb = mem.total_kb.saturating_sub(mem.available_kb) / 1024;
-        let used_pct = if mem.total_kb > 0 { (used_mb as f32 / total_mb as f32) * 100.0 } else { 0.0 };
-
-        let stats = [
-            ("Used", format!("{:5} MB ({:.0}%)", used_mb, used_pct), usage_color(used_pct)),
-            ("Free", format!("{:5} MB", mem.available_kb / 1024), GREEN),
-            ("Swap", format!("{:5} MB", mem.swap_total_kb.saturating_sub(mem.swap_free_kb) / 1024), PURPLE),
-        ];
-
-        for (i, (label, value, color)) in stats.iter().enumerate() {
-            if (i as u16) < inner.height {
-                let line = Line::from(vec![
-                    Span::styled(format!("{:<5}", label), Style::default().fg(FG_DIM)),
-                    Span::styled(value, Style::default().fg(*color)),
-                ]);
-                frame.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.y + i as u16, inner.width, 1));
-            }
-        }
-    }
-}
-
-fn draw_battery_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = styled_block("Battery");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let bat = &app.battery_data;
-    let level_color = if bat.level > 50 { GREEN } else if bat.level > 20 { YELLOW } else { RED };
-    let status_color = if bat.status == "Charging" { AQUA } else { FG_DIM };
-
-    let stats = [
-        (format!("{}%", bat.level), level_color),
-        (format!("{:.1}\u{00B0}C", bat.temperature), temp_color(bat.temperature)),
-        (bat.status.clone(), status_color),
-    ];
-
-    for (i, (value, color)) in stats.iter().enumerate() {
-        if (i as u16) < inner.height {
-            frame.render_widget(
-                Paragraph::new(value.as_str()).style(Style::default().fg(*color)),
-                Rect::new(inner.x, inner.y + i as u16, inner.width, 1)
-            );
-        }
-    }
-}
-
-fn draw_thermal_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = styled_block("Thermal");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let thermal = &app.metrics.thermal;
-    let temps = [("AP", thermal.ap), ("SK", thermal.skin), ("BT", thermal.battery)];
-    for (i, (name, val)) in temps.iter().enumerate() {
-        if (i as u16) < inner.height {
-            let line = Line::from(vec![
-                Span::styled(format!("{} ", name), Style::default().fg(FG_DIM)),
-                Span::styled(format!("{:4.1}\u{00B0}C", val), Style::default().fg(temp_color(*val))),
-            ]);
-            frame.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.y + i as u16, inner.width, 1));
-        }
-    }
-}
-
-fn draw_network_panel(frame: &mut Frame, app: &App, area: Rect) {
-    // With the capture agent running, an app's own traffic is known; otherwise only the device's.
-    let app_traffic = if app.package.is_some() { app.capture_traffic() } else { None };
-    let block = styled_block(if app_traffic.is_some() { "Network (app)" } else { "Network" });
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 { return; }
-
-    let text_lines: usize = 2;
-    let stats = if let Some(t) = app_traffic {
-        [
-            (format!("\u{2193} {}/s  {}", format_bytes(t.rx_rate), format_bytes(t.rx_bytes)), AQUA),
-            (format!("\u{2191} {}/s  {}", format_bytes(t.tx_rate), format_bytes(t.tx_bytes)), PURPLE),
-        ]
-    } else {
-        let net = &app.network_data;
-        let wifi_icon = if net.wifi_connected { "\u{25CF}" } else { "\u{25CB}" };
-        let mobile_icon = if net.mobile_connected { "\u{25CF}" } else { "\u{25CB}" };
-        [
-            (format!("{} Wi \u{2193}{} \u{2191}{}", wifi_icon, format_bytes(net.wifi_rx_bytes), format_bytes(net.wifi_tx_bytes)), if net.wifi_connected { AQUA } else { FG_DIM }),
-            (format!("{} Mo \u{2193}{} \u{2191}{}", mobile_icon, format_bytes(net.mobile_rx_bytes), format_bytes(net.mobile_tx_bytes)), if net.mobile_connected { PURPLE } else { FG_DIM }),
-        ]
-    };
-    for (i, (value, color)) in stats.iter().enumerate() {
-        if (i as u16) < inner.height {
-            frame.render_widget(
-                Paragraph::new(value.as_str()).style(Style::default().fg(*color)),
-                Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
-            );
-        }
-    }
-
-    let history = if app_traffic.is_some() { &app.capture_rx_history } else { &app.net_rx_history };
-    let sparkline_height = (inner.height as usize).saturating_sub(text_lines);
-    if sparkline_height > 0 && !history.is_empty() {
-        let spark_area = Rect::new(
-            inner.x,
-            inner.y + text_lines as u16,
-            inner.width,
-            sparkline_height as u16,
-        );
-        let max_val = history.iter().copied().max().unwrap_or(1).max(1);
-        frame.render_widget(
-            Sparkline::default()
-                .data(history)
-                .max(max_val)
-                .style(Style::default().fg(AQUA)),
-            spark_area,
+    if inner.height > 0 {
+        pen.segs(
+            inner.x + 2,
+            inner.bottom() - 1,
+            &[
+                ("press a key, or ↑↓ enter", t.dim, false),
+                ("   esc", t.yellow, false),
+                (" close", t.dim, false),
+                (
+                    "   changes to the phone are undone when you quit",
+                    t.dim,
+                    false,
+                ),
+            ],
+            inner.right(),
         );
     }
 }
 
-fn format_bytes(b: u64) -> String {
-    if b > 1_000_000_000 { format!("{:.1}G", b as f64 / 1_000_000_000.0) }
-    else if b > 1_000_000 { format!("{:.1}M", b as f64 / 1_000_000.0) }
-    else if b > 1_000 { format!("{:.1}K", b as f64 / 1_000.0) }
-    else { format!("{}B", b) }
-}
-
-fn format_age(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs < 60 { format!("{}s", secs) } else if secs < 3600 { format!("{}m", secs / 60) } else { format!("{}h", secs / 3600) }
-}
-
-fn format_ip(bytes: &[u8]) -> String {
-    match bytes.len() {
-        4 => std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string(),
-        16 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(bytes);
-            std::net::Ipv6Addr::from(octets).to_string()
-        }
-        _ => "?".to_string(),
-    }
-}
-
-/// Every connection the agent saw (for the selected package, if any), like a live netstat.
-fn draw_connections_fullscreen(frame: &mut Frame, app: &App, area: Rect) {
-    use crate::agent::proto::{ConnectionState, Protocol};
-
-    let connections = app.capture_connections();
-    let title = format!("Connections [{}] [n] exit fullscreen", connections.len());
-    let block = styled_block(&title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height < 3 || inner.width == 0 { return; }
-
-    let Some(capture) = &app.capture else {
-        let message = if app.capture_wanted {
-            "Waiting for the capture agent on the phone (accept the VPN request there the first time)..."
-        } else {
-            "Capture is off. Press c to start it; it needs the agent app from android-agent/ on the phone."
-        };
-        frame.render_widget(Paragraph::new(message).style(Style::default().fg(FG_DIM)), inner);
-        return;
-    };
-
-    let traffic = app.capture_traffic().unwrap_or_default();
-    let stats = capture.snapshot.stats.unwrap_or_default();
-    let summary = format!(
-        " \u{2193} {} ({}/s)  \u{2191} {} ({}/s)  open {}  |  device: TCP {}, UDP {}, DNS lookups {}  |  agent {}",
-        format_bytes(traffic.rx_bytes), format_bytes(traffic.rx_rate),
-        format_bytes(traffic.tx_bytes), format_bytes(traffic.tx_rate),
-        traffic.open_connections, stats.open_tcp, stats.open_udp,
-        capture.snapshot.dns.len(), capture.snapshot.agent_version,
+fn console_popup(pen: &mut Pen, app: &App, area: Rect) {
+    let t = pen.t;
+    let c = &app.console;
+    let r = Rect::new(
+        area.x + 2,
+        area.y + 2,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(5),
     );
-    frame.render_widget(Paragraph::new(summary).style(Style::default().fg(AQUA)), Rect::new(inner.x, inner.y, inner.width, 1));
-
-    let show_app = app.package.is_none();
-    let header = if show_app {
-        " PROTO STATE     \u{2193} RX     \u{2191} TX    AGE  APP                     HOST"
+    pen.clear(r);
+    let status = if c.running {
+        format!(
+            "running {:.0}s · {} lines",
+            c.started.map_or(0.0, |s| s.elapsed().as_secs_f32()),
+            c.lines.len()
+        )
     } else {
-        " PROTO STATE     \u{2193} RX     \u{2191} TX    AGE  HOST"
+        let code = c
+            .code
+            .map_or("stopped".to_string(), |code| format!("exit {code}"));
+        format!(
+            "{code} · {:.1}s · {} lines",
+            c.took.map_or(0.0, |d| d.as_secs_f32()),
+            c.lines.len()
+        )
     };
-    frame.render_widget(Paragraph::new(header).style(Style::default().fg(FG_DIM)), Rect::new(inner.x, inner.y + 1, inner.width, 1));
-
-    let now = capture.snapshot.time_ms;
-    let visible_rows = (inner.height as usize).saturating_sub(2);
-    for (i, c) in connections.iter().take(visible_rows).enumerate() {
-        let y = inner.y + 2 + i as u16;
-        let proto = if c.protocol == Protocol::Udp as i32 { "udp" } else { "tcp" };
-        let (state, color) = match ConnectionState::try_from(c.state).unwrap_or(ConnectionState::StateUnknown) {
-            ConnectionState::Open => ("open", GREEN),
-            ConnectionState::Connecting => ("conn", YELLOW),
-            ConnectionState::Failed => ("failed", RED),
-            _ => ("closed", FG_DIM),
-        };
-        let mut host = if c.host.is_empty() { format_ip(&c.remote_ip) } else { c.host.clone() };
-        host.push_str(&format!(":{}", c.remote_port));
-        if !c.error.is_empty() {
-            host.push_str(&format!("  ({})", c.error));
-        }
-
-        let mut spans = vec![
-            Span::styled(format!(" {:<6}", proto), Style::default().fg(FG_DIM)),
-            Span::styled(format!("{:<7}", state), Style::default().fg(color)),
-            Span::styled(format!("{:>8} ", format_bytes(c.rx_bytes)), Style::default().fg(AQUA)),
-            Span::styled(format!("{:>8} ", format_bytes(c.tx_bytes)), Style::default().fg(PURPLE)),
-            Span::styled(format!("{:>5}  ", format_age(now.saturating_sub(c.start_ms))), Style::default().fg(FG_DIM)),
-        ];
-        if show_app {
-            spans.push(Span::styled(format!("{:<24}", truncate_str(app.capture_app_name(c.uid), 23)), Style::default().fg(BLUE)));
-        }
-        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        spans.push(Span::styled(truncate_str(&host, (inner.width as usize).saturating_sub(used)), Style::default().fg(FG)));
-        frame.render_widget(Paragraph::new(Line::from(spans)), Rect::new(inner.x, y, inner.width, 1));
-    }
-}
-
-fn draw_doze_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = styled_block("Power");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let doze = &app.doze_data;
-    let idle_color = |state: &str| if state == "ACTIVE" { GREEN } else { YELLOW };
-    let bucket_color = match doze.app_standby_bucket.as_str() {
-        "ACTIVE" => GREEN,
-        "WORKING_SET" => AQUA,
-        "FREQUENT" => YELLOW,
-        "RARE" | "RESTRICTED" => RED,
-        _ => FG_DIM,
-    };
-
-    let mut stats = vec![
-        (format!("Deep:  {}", doze.device_idle_state), idle_color(&doze.device_idle_state)),
-        (format!("Light: {}", doze.light_idle_state), idle_color(&doze.light_idle_state)),
-    ];
-    if app.package.is_some() {
-        stats.push((format!("Bucket: {}", doze.app_standby_bucket), bucket_color));
-    }
-
-    for (i, (value, color)) in stats.iter().enumerate() {
-        if (i as u16) < inner.height {
-            frame.render_widget(
-                Paragraph::new(value.as_str()).style(Style::default().fg(*color)),
-                Rect::new(inner.x, inner.y + i as u16, inner.width, 1)
-            );
-        }
-    }
-}
-
-fn draw_threads_jobs_network_row(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    draw_threads_compact(frame, app, chunks[0]);
-    draw_right_panels(frame, app, chunks[1]);
-}
-
-fn draw_right_panels(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
-
-    let top_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[0]);
-
-    draw_jobs_panel(frame, app, top_chunks[0]);
-    draw_alarms_panel(frame, app, top_chunks[1]);
-
-    let bottom_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(chunks[1]);
-
-    draw_network_panel(frame, app, bottom_chunks[0]);
-    draw_thermal_panel(frame, app, bottom_chunks[1]);
-}
-
-fn draw_jobs_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = styled_block("Jobs");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 { return; }
-
-    let jobs = &app.jobs_data;
-
-    let summary = if app.package.is_some() {
-        format!("App P:{} R:{}", jobs.app_pending, jobs.app_running)
+    let status_color = if c.running {
+        t.yellow
+    } else if c.code == Some(0) {
+        t.green
     } else {
-        format!("Reg:{} Run:{}", jobs.total_pending, jobs.total_running)
+        t.red
     };
-    frame.render_widget(
-        Paragraph::new(summary).style(Style::default().fg(AQUA)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
+    let inner = pen.panel(
+        r,
+        &[(&trunc(&c.title, r.width as usize / 2), t.yellow, true)],
+        &[(&status, status_color, false)],
+        Some(t.aqua),
     );
-
-    if !jobs.top_job_packages.is_empty() {
-        let max_rows = (inner.height as usize).saturating_sub(1);
-        for (i, (pkg, count)) in jobs.top_job_packages.iter().take(max_rows).enumerate() {
-            let y = inner.y + 1 + i as u16;
-            let is_running = jobs.running_packages.iter().any(|r| r == pkg);
-            let marker = if is_running { "\u{25CF} " } else { "  " };
-            let short = pkg.split('.').last().unwrap_or(pkg);
-            let w = inner.width as usize;
-            let count_str = format!("{:>3} ", count);
-            let name_max = w.saturating_sub(count_str.len() + marker.len());
-            let name = truncate_str(short, name_max);
-            let line = Line::from(vec![
-                Span::styled(marker, Style::default().fg(GREEN)),
-                Span::styled(count_str, Style::default().fg(YELLOW)),
-                Span::styled(name, Style::default().fg(if is_running { FG } else { FG_DIM })),
-            ]);
-            frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
-        }
-    }
-}
-
-fn draw_alarms_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let block = styled_block("Alarms");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 { return; }
-
-    let alarms = &app.alarms_data;
-
-    let summary = if app.package.is_some() {
-        format!("App: {}", alarms.app_pending)
-    } else {
-        format!("Pending: {}", alarms.total_pending)
-    };
-    frame.render_widget(
-        Paragraph::new(summary).style(Style::default().fg(YELLOW)),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-
-    if !alarms.top_alarm_packages.is_empty() {
-        let max_rows = (inner.height as usize).saturating_sub(1);
-        for (i, (pkg, count)) in alarms.top_alarm_packages.iter().take(max_rows).enumerate() {
-            let y = inner.y + 1 + i as u16;
-            let short = pkg.split('.').last().unwrap_or(pkg);
-            let w = inner.width as usize;
-            let count_str = format!("{:>3} ", count);
-            let name_max = w.saturating_sub(count_str.len());
-            let name = truncate_str(short, name_max);
-            let line = Line::from(vec![
-                Span::styled(count_str, Style::default().fg(ORANGE)),
-                Span::styled(name, Style::default().fg(FG_DIM)),
-            ]);
-            frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
-        }
-    }
-}
-
-fn draw_threads_compact(frame: &mut Frame, app: &App, area: Rect) {
-    let total = app.metrics.threads.len();
-    let title = format!("Threads [{}] [f] fullscreen", total);
-    let block = styled_block(&title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 { return; }
-
-    let header = if app.package.is_some() {
-        " TID     CPU   CORE TIME       NAME"
-    } else {
-        " PID     CPU   MEM   TIME       NAME"
-    };
-    frame.render_widget(Paragraph::new(header).style(Style::default().fg(FG_DIM)), Rect::new(inner.x, inner.y, inner.width, 1));
-
-    let visible_rows = (inner.height as usize).saturating_sub(1);
-    for (i, thread) in app.metrics.threads.iter().take(visible_rows).enumerate() {
-        let y = inner.y + 1 + i as u16;
-        if y >= inner.y + inner.height { break; }
-
-        let line = Line::from(vec![
-            Span::styled(format!(" {:<7}", thread.pid), Style::default().fg(FG_DIM)),
-            Span::styled(format!("{:5.1}%", thread.cpu_percent), Style::default().fg(usage_color(thread.cpu_percent))),
-            Span::styled(format!("{:>6}", thread_mem_or_core(thread)), Style::default().fg(PURPLE)),
-            Span::styled(format!(" {:<10}", thread.time), Style::default().fg(FG_DIM)),
-            Span::styled(truncate_str(&thread.name, (inner.width as usize).saturating_sub(32)), Style::default().fg(FG)),
-        ]);
-        frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
-    }
-}
-
-fn draw_threads_fullscreen(frame: &mut Frame, app: &App, area: Rect) {
-    let total = app.metrics.threads.len();
-    let title = format!("Threads [{}] [f] exit fullscreen", total);
-    let block = styled_block(&title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 { return; }
-
-    let header = if app.package.is_some() {
-        " TID       CPU%    CORE    TIME         NAME"
-    } else {
-        " PID       CPU%    MEM%    TIME         NAME"
-    };
-    frame.render_widget(Paragraph::new(header).style(Style::default().fg(FG_DIM)), Rect::new(inner.x, inner.y, inner.width, 1));
-
-    let visible_rows = (inner.height as usize).saturating_sub(1);
-    for (i, thread) in app.metrics.threads.iter().take(visible_rows).enumerate() {
-        let y = inner.y + 1 + i as u16;
-        if y >= inner.y + inner.height { break; }
-
-        let line = Line::from(vec![
-            Span::styled(format!(" {:<9}", thread.pid), Style::default().fg(FG_DIM)),
-            Span::styled(format!("{:6.1}%  ", thread.cpu_percent), Style::default().fg(usage_color(thread.cpu_percent))),
-            Span::styled(format!("{:>7}  ", thread_mem_or_core(thread)), Style::default().fg(PURPLE)),
-            Span::styled(format!("{:<12} ", thread.time), Style::default().fg(FG_DIM)),
-            Span::styled(&thread.name, Style::default().fg(FG)),
-        ]);
-        frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
-    }
-}
-
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let shortcuts = "q:quit  space:pause  d:device  p:package  x:clear pkg  f:threads  n:connections  c:capture";
-
-    let mut spans = vec![
-        Span::styled(format!(" {} ", shortcuts), Style::default().fg(FG_DIM)),
-    ];
-
-    if let Some(msg) = app.last_error.as_ref().or(app.capture_error.as_ref()).or(app.recorder_error.as_ref()) {
-        spans.push(Span::styled(" | ", Style::default().fg(FG_DIM)));
-        spans.push(Span::styled(msg.as_str(), Style::default().fg(RED)));
-    }
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn draw_device_popup(frame: &mut Frame, app: &App) {
-    let popup = centered_rect(50, 50, frame.area());
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(" Select Device ")
-        .title_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(PURPLE))
-        .style(Style::default().bg(BG));
-
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    if app.devices.is_empty() {
-        frame.render_widget(Paragraph::new("No devices...").style(Style::default().fg(ORANGE)), inner);
+    if inner.height < 2 {
         return;
     }
-
-    let items: Vec<ListItem> = app.devices.iter().enumerate().map(|(i, d)| {
-        let style = if i == app.selected_device { Style::default().fg(GREEN).add_modifier(Modifier::BOLD) } else { Style::default().fg(FG_DIM) };
-        let prefix = if i == app.selected_device { "> " } else { "  " };
-        ListItem::new(format!("{}{} ({})", prefix, d.model, d.serial)).style(style)
-    }).collect();
-
-    frame.render_widget(List::new(items), inner);
+    let body = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height - 1,
+    );
+    let visible = body.height as usize;
+    let end = c.lines.len().saturating_sub(c.scroll);
+    let start = end.saturating_sub(visible);
+    for (i, (line, err)) in c.lines.iter().skip(start).take(end - start).enumerate() {
+        pen.text(
+            body.x,
+            body.y + i as u16,
+            line,
+            if *err { t.orange } else { t.fg },
+            false,
+            body.right(),
+        );
+    }
+    if c.lines.is_empty() && !c.running {
+        pen.note(body, "(no output)", t.dim);
+    }
+    let hint: Vec<Seg> = if c.running {
+        vec![
+            ("esc", t.yellow, false),
+            (" stop  ", t.dim, false),
+            ("↑↓ pgup pgdn", t.yellow, false),
+            (" scroll  ", t.dim, false),
+            ("end", t.yellow, false),
+            (" follow", t.dim, false),
+        ]
+    } else {
+        vec![
+            (":", t.yellow, false),
+            (" new command  ", t.dim, false),
+            ("↑↓ pgup pgdn home end", t.yellow, false),
+            (" scroll  ", t.dim, false),
+            ("esc", t.yellow, false),
+            (" close", t.dim, false),
+        ]
+    };
+    let x = pen.segs(inner.x + 1, inner.bottom() - 1, &hint, inner.right());
+    if c.scroll > 0 {
+        pen.text(
+            x + 2,
+            inner.bottom() - 1,
+            &format!("↑ {} lines above the end", c.scroll),
+            t.dim,
+            false,
+            inner.right(),
+        );
+    }
 }
 
-fn draw_package_popup(frame: &mut Frame, app: &App) {
-    let popup = centered_rect(60, 70, frame.area());
-    frame.render_widget(Clear, popup);
+fn prompt(pen: &mut Pen, app: &App, area: Rect) {
+    let t = pen.t;
+    let r = Rect::new(area.x, area.bottom().saturating_sub(4), area.width, 3);
+    pen.clear(r);
+    let device = app.serial.clone().unwrap_or_else(|| "no device".into());
+    let inner = pen.panel(
+        r,
+        &[("adb", t.yellow, true)],
+        &[
+            ("-s ", t.dim, false),
+            (&device, t.purple, false),
+            ("   enter", t.yellow, false),
+            (" run  ", t.dim, false),
+            ("↑↓", t.yellow, false),
+            (" history  ", t.dim, false),
+            ("esc", t.yellow, false),
+            (" cancel", t.dim, false),
+        ],
+        Some(t.yellow),
+    );
+    let placeholder = "shell dumpsys battery · logcat -d -t 200 · shell am start -n …";
+    let shown = if app.console.input.is_empty() {
+        placeholder
+    } else {
+        app.console.input.as_str()
+    };
+    let x = pen.segs(
+        inner.x + 1,
+        inner.y,
+        &[("adb › ", t.yellow, true)],
+        inner.right(),
+    );
+    if app.console.input.is_empty() {
+        pen.text(x, inner.y, "_", t.yellow, false, inner.right());
+        pen.text(x + 2, inner.y, shown, t.dim, false, inner.right());
+    } else {
+        let end = pen.text(x, inner.y, shown, t.fg, false, inner.right());
+        pen.text(end, inner.y, "_", t.yellow, false, inner.right());
+    }
+}
 
-    let block = Block::default()
-        .title(" Select Package ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(AQUA))
-        .style(Style::default().bg(BG));
+pub fn tail(s: &Series, n: usize) -> Vec<f32> {
+    let len = s.len();
+    let mut out = vec![f32::NAN; n.saturating_sub(len)];
+    let start = len.saturating_sub(n);
+    out.extend((start..len).map(|i| s.get(i)));
+    out
+}
 
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    if inner.height < 3 { return; }
+pub fn markers(app: &App, n: usize) -> Vec<(usize, String)> {
+    let ticks = app.session.ticks;
+    app.session
+        .markers
+        .iter()
+        .filter_map(|m| {
+            let back = (ticks - m.tick) as usize;
+            (back < n).then(|| (n - 1 - back, m.label.clone()))
+        })
+        .collect()
+}
 
-    let search_text = if app.package_search.is_empty() { "filter..." } else { &app.package_search };
-    let line = Line::from(vec![
-        Span::styled(" > ", Style::default().fg(YELLOW)),
-        Span::styled(search_text, Style::default().fg(if app.package_search.is_empty() { FG_DIM } else { FG })),
-        Span::styled("_", Style::default().fg(YELLOW)),
+pub fn span_label(s: u32) -> String {
+    match (s / 60, s % 60) {
+        (0, sec) => format!("{sec}s"),
+        (m, 0) => format!("{m}m"),
+        (m, sec) => format!("{m}m{sec:02}s"),
+    }
+}
+
+pub fn xlabels(window_s: u32) -> [String; 3] {
+    [
+        format!("-{}", span_label(window_s)),
+        format!("-{}", span_label(window_s / 2)),
+        "now".into(),
+    ]
+}
+
+pub fn unsupported(app: &App, source: Source) -> Option<String> {
+    match app.session.support(source) {
+        Support::Unsupported(r) => Some(format!("Not supported on this device: {r}")),
+        _ => None,
+    }
+}
+
+pub fn app_gate(app: &App) -> Option<&'static str> {
+    match app.session.app_state {
+        AppState::NotSelected if app.package().is_none() => Some("Pick an app with p to see this"),
+        AppState::NotRunning => Some("The app is not running; start it on the phone"),
+        _ => None,
+    }
+}
+
+fn tab_bar(pen: &mut Pen, app: &App, r: Rect) {
+    let t = pen.t;
+    pen.fill(r, t.hi);
+    let mut x = pen.text(r.x + 1, r.y, "◉ android-perf", t.yellow, true, r.right()) + 2;
+    for (i, name) in PAGES.iter().enumerate() {
+        let label = format!(" {} {} ", i + 1, name);
+        let on = i == app.page;
+        let start = x;
+        x = pen.text(x, r.y, &label, if on { t.bg } else { t.dim }, on, r.right());
+        if on {
+            for xx in start..x {
+                if let Some(c) = pen.cell(xx, r.y) {
+                    c.set_bg(t.yellow);
+                }
+            }
+        }
+        x += 1;
+    }
+    let caps = app.session.caps.as_ref();
+    let model = caps
+        .map(|c| c.model.clone())
+        .or_else(|| {
+            app.devices
+                .iter()
+                .find(|d| Some(&d.serial) == app.serial.as_ref())
+                .map(|d| d.model.clone())
+        })
+        .unwrap_or_else(|| "no device".into());
+    let android = caps
+        .map(|c| format!("  Android {}  ", c.release))
+        .unwrap_or_else(|| "  ".into());
+    let pkg = app.package().unwrap_or("whole device").to_string();
+    let pid = app
+        .session
+        .fast
+        .as_ref()
+        .and_then(|f| f.app.as_ref())
+        .map(|a| format!("  pid {}", a.pid))
+        .unwrap_or_default();
+    pen.rsegs(
+        r.right() - 1,
+        r.y,
+        &[
+            (&model, t.purple, false),
+            (&android, t.dim, false),
+            (&pkg, t.aqua, false),
+            (&pid, t.dim, false),
+        ],
+        x + 2,
+    );
+}
+
+fn status_bar(pen: &mut Pen, app: &App, r: Rect) {
+    let t = pen.t;
+    let s = &app.session;
+    let sep = ("  │  ", t.gray, false);
+    let elapsed = fmt_dur(s.elapsed().as_secs_f64());
+    let rec: (&str, ratatui::style::Color, bool) = if app.paused {
+        ("❚❚ PAUSED ", t.yellow, true)
+    } else {
+        ("● REC ", t.green, true)
+    };
+    let ticks = format!("  #{} @{}", s.ticks, interval_label(s.interval_s()));
+    let window = xlabels(app.window_s)[0].trim_start_matches('-').to_string();
+    let (mode_label, mode_value, mode_color) = match app.package() {
+        Some(p) => ("PACKAGE ", p.to_string(), t.aqua),
+        None => ("", "DEVICE-WIDE".to_string(), t.purple),
+    };
+    let capture = if s.capture.snapshot.is_some() {
+        let open = s
+            .capture
+            .snapshot
+            .as_ref()
+            .and_then(|x| x.stats)
+            .map_or(0, |st| st.open_tcp + st.open_udp);
+        (format!("● {open} open"), t.green)
+    } else if app.capture_busy || app.capture_on {
+        ("starting…".to_string(), t.yellow)
+    } else if s.support(Source::Capture).is_unsupported() {
+        ("not installed".to_string(), t.dim)
+    } else {
+        ("off (c)".to_string(), t.dim)
+    };
+    let mut segs: Vec<(String, ratatui::style::Color, bool)> = vec![
+        (rec.0.to_string(), rec.1, rec.2),
+        (elapsed, t.fg, false),
+        (ticks, t.dim, false),
+        (sep.0.into(), sep.1, false),
+        ("window ".into(), t.dim, false),
+        (window, t.fg, false),
+        (sep.0.into(), sep.1, false),
+        (mode_label.into(), t.dim, false),
+        (mode_value, mode_color, true),
+    ];
+    if s.app_state == AppState::NotRunning {
+        segs.push(("  NOT RUNNING".into(), t.red, true));
+    }
+    segs.extend([
+        (sep.0.into(), sep.1, false),
+        ("CAPTURE ".into(), t.dim, false),
+        (capture.0, capture.1, false),
     ]);
-    frame.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.y, inner.width, 1));
-    frame.render_widget(Paragraph::new("-".repeat(inner.width as usize)).style(Style::default().fg(FG_DIM)), Rect::new(inner.x, inner.y + 1, inner.width, 1));
+    if let Some(th) = &s.thermal {
+        let c = if th.status == 0 {
+            t.green
+        } else if th.status == 1 {
+            t.orange
+        } else {
+            t.red
+        };
+        segs.extend([
+            (sep.0.into(), sep.1, false),
+            ("THERMAL ".into(), t.dim, false),
+            (thermal_level_name(th.status).into(), c, true),
+        ]);
+    }
+    if let Some(b) = &s.battery {
+        segs.extend([
+            (sep.0.into(), sep.1, false),
+            ("BAT ".into(), t.dim, false),
+            (
+                format!("{}% ", b.level),
+                if b.level > 20 { t.green } else { t.red },
+                false,
+            ),
+        ]);
+        let faked = app.tweaks.unplugged || app.tweaks.doze;
+        match b.drain_ma().filter(|_| !faked) {
+            Some(ma) => segs.push((format!("↓{ma:.0} mA"), t.yellow, false)),
+            None if faked => segs.push(("fake unplugged".into(), t.dim, false)),
+            None => segs.push((
+                if b.plugged == "none" {
+                    b.status.clone()
+                } else {
+                    format!("⚡ {}", b.plugged)
+                },
+                t.dim,
+                false,
+            )),
+        }
+    }
+    let mut badges: Vec<String> = Vec::new();
+    if app.tweaks.doze {
+        badges.push("DOZE FORCED".into());
+    } else if app.tweaks.unplugged {
+        badges.push("FAKE UNPLUG".into());
+    }
+    if let Some(b) = &app.tweaks.bucket_set {
+        badges.push(format!("BUCKET {}", b.to_uppercase()));
+    }
+    if !badges.is_empty() {
+        segs.extend([
+            (sep.0.into(), sep.1, false),
+            (format!("⚠ {}", badges.join(" · ")), t.orange, true),
+        ]);
+    }
+    if app.console.running && app.popup != Popup::Console {
+        segs.extend([
+            (sep.0.into(), sep.1, false),
+            ("adb running".into(), t.yellow, false),
+        ]);
+    }
+    if let Some(m) = s.markers.last() {
+        let ago = s.elapsed().as_secs_f64() - m.secs;
+        segs.extend([
+            (sep.0.into(), sep.1, false),
+            (format!("▾{}", m.label), t.yellow, true),
+            (format!(" {} ago", fmt_age(ago)), t.dim, false),
+        ]);
+    }
+    let refs: Vec<Seg> = segs.iter().map(|(a, b, c)| (a.as_str(), *b, *c)).collect();
+    pen.segs(r.x + 1, r.y, &refs, r.right());
+}
 
-    let list_area = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(2));
-    if app.filtered_packages.is_empty() {
-        frame.render_widget(Paragraph::new("No matches").style(Style::default().fg(ORANGE)), list_area);
+pub fn interval_label(s: f32) -> String {
+    if s < 1.0 {
+        format!("{:.0}ms", s * 1000.0)
+    } else if s.fract() == 0.0 {
+        format!("{s:.0}s")
+    } else {
+        format!("{s:.1}s")
+    }
+}
+
+fn footer(pen: &mut Pen, app: &App, r: Rect) {
+    let t = pen.t;
+    if let Some(toast) = &app.toast {
+        pen.text(
+            r.x + 1,
+            r.y,
+            &trunc(&toast.text, r.width as usize - 2),
+            if toast.error { t.red } else { t.aqua },
+            false,
+            r.right(),
+        );
         return;
     }
-
-    let visible = (list_area.height as usize).max(1);
-    let offset = (app.selected_package + 1).saturating_sub(visible);
-    let items: Vec<ListItem> = app.filtered_packages.iter().enumerate().skip(offset).take(visible).map(|(i, &idx)| {
-        let pkg = &app.packages[idx];
-        let style = if i == app.selected_package { Style::default().fg(GREEN).add_modifier(Modifier::BOLD) } else { Style::default().fg(FG_DIM) };
-        ListItem::new(format!("{}{}", if i == app.selected_package { "> " } else { "  " }, pkg)).style(style)
-    }).collect();
-
-    frame.render_widget(List::new(items), list_area);
-}
-
-fn usage_color(percent: f32) -> Color {
-    if percent > 80.0 { RED } else if percent > 50.0 { ORANGE } else if percent > 20.0 { GREEN } else { FG_DIM }
-}
-
-fn temp_color(temp: f32) -> Color {
-    if temp > 45.0 { RED } else if temp > 38.0 { ORANGE } else { GREEN }
-}
-
-fn thread_mem_or_core(thread: &crate::data::ThreadInfo) -> String {
-    match (thread.mem_percent, thread.core) {
-        (Some(mem), _) => format!("{:.1}%", mem),
-        (None, Some(core)) => core.to_string(),
-        (None, None) => "-".to_string(),
+    if app.filtering {
+        pen.segs(
+            r.x + 1,
+            r.y,
+            &[
+                ("filter: ", t.dim, false),
+                (&app.table_filter, t.fg, false),
+                ("_", t.yellow, false),
+                ("   enter keep · esc clear", t.dim, false),
+            ],
+            r.right(),
+        );
+        return;
+    }
+    if let Some((src, e)) = &app.session.last_error {
+        pen.text(
+            r.x + 1,
+            r.y,
+            &trunc(&format!("[{}] {e}", src.label()), r.width as usize - 2),
+            t.red,
+            false,
+            r.right(),
+        );
+        return;
+    }
+    if !app.config.key_hints {
+        pen.segs(
+            r.x + 1,
+            r.y,
+            &[("?", t.yellow, false), (" keys", t.dim, false)],
+            r.right(),
+        );
+        return;
+    }
+    let page_keys: &[(&str, &str)] = match app.page {
+        1 => &[
+            ("s", "sort"),
+            ("g", "pools"),
+            ("/", "filter"),
+            ("↑↓", "scroll"),
+        ],
+        3 => &[("r", "reset stats")],
+        4 => &[("s", "sort"), ("/", "filter"), ("↑↓", "scroll")],
+        5 => &[("z", "doze"), ("b", "bucket"), ("u", "fake unplug")],
+        _ => &[],
+    };
+    let common: &[(&str, &str)] = &[
+        ("1-6", "pages"),
+        ("a", "actions"),
+        (":", "adb"),
+        ("m", "mark"),
+        ("w", "window"),
+        ("space", "pause"),
+        ("p", "app"),
+        ("d", "device"),
+        ("c", "capture"),
+        ("e", "export"),
+        ("t", "theme"),
+        (",", "settings"),
+        ("?", "help"),
+        ("q", "quit"),
+    ];
+    let mut x = r.x + 1;
+    for (k, v) in page_keys {
+        x = pen.segs(
+            x,
+            r.y,
+            &[
+                (k, t.yellow, false),
+                (" ", t.dim, false),
+                (v, t.dim, false),
+                ("  ", t.dim, false),
+            ],
+            r.right(),
+        );
+    }
+    if !page_keys.is_empty() {
+        x = pen.text(x, r.y, "│  ", t.gray, false, r.right());
+    }
+    if !app.table_filter.is_empty() {
+        x = pen.segs(
+            x,
+            r.y,
+            &[
+                ("filter ", t.dim, false),
+                (&app.table_filter, t.yellow, false),
+                ("  ", t.dim, false),
+            ],
+            r.right(),
+        );
+    }
+    for (k, v) in common {
+        x = pen.segs(
+            x,
+            r.y,
+            &[
+                (k, t.yellow, false),
+                (" ", t.dim, false),
+                (v, t.dim, false),
+                ("  ", t.dim, false),
+            ],
+            r.right(),
+        );
     }
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max > 3 {
-        format!("{}...", s.chars().take(max - 3).collect::<String>())
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width.saturating_sub(4));
+    let h = h.min(area.height.saturating_sub(2));
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+fn device_popup(pen: &mut Pen, app: &App, area: Rect) {
+    let t = pen.t;
+    let r = centered(area, 70, (app.devices.len() as u16 + 4).max(7));
+    pen.clear(r);
+    let inner = pen.panel(
+        r,
+        &[("Select device", t.yellow, true)],
+        &[
+            ("enter", t.yellow, false),
+            (" pick  ", t.dim, false),
+            ("esc", t.yellow, false),
+            (" close", t.dim, false),
+        ],
+        Some(t.purple),
+    );
+    if app.devices.is_empty() {
+        pen.note(
+            inner,
+            "No devices. Connect one and enable USB debugging.",
+            t.orange,
+        );
+        return;
+    }
+    for (i, d) in app.devices.iter().enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.bottom() {
+            break;
+        }
+        let sel = i == app.cursor;
+        if sel {
+            pen.fill(Rect::new(inner.x, y, inner.width, 1), t.sel);
+        }
+        let ready = d.state == "device";
+        let current = app.serial.as_ref() == Some(&d.serial);
+        pen.segs(
+            inner.x + 1,
+            y,
+            &[
+                (if current { "● " } else { "  " }, t.green, false),
+                (&pad(&d.model, 24), if ready { t.fg } else { t.dim }, sel),
+                (&pad(&d.serial, 26), t.dim, false),
+                (&d.state, if ready { t.green } else { t.red }, false),
+            ],
+            inner.right(),
+        );
+    }
+}
+
+fn package_popup(pen: &mut Pen, app: &App, area: Rect) {
+    let t = pen.t;
+    let r = centered(area, 76, area.height * 3 / 4);
+    pen.clear(r);
+    let list = app.filtered_packages();
+    let count = format!("{} running", list.len());
+    let inner = pen.panel(
+        r,
+        &[("Select app", t.yellow, true)],
+        &[(&count, t.dim, false)],
+        Some(t.aqua),
+    );
+    if inner.height < 4 {
+        return;
+    }
+    let placeholder = if app.filter.is_empty() {
+        "type to filter…"
     } else {
-        s.chars().take(max).collect()
+        app.filter.as_str()
+    };
+    pen.segs(
+        inner.x + 1,
+        inner.y,
+        &[
+            ("› ", t.yellow, true),
+            (
+                placeholder,
+                if app.filter.is_empty() { t.dim } else { t.fg },
+                false,
+            ),
+            ("_", t.yellow, false),
+        ],
+        inner.right(),
+    );
+    for x in inner.x..inner.right() {
+        pen.put(x, inner.y + 1, "─", t.dim2);
+    }
+    let rows = (inner.height - 2) as usize;
+    let total = list.len() + 1;
+    let offset = (app.cursor + 1)
+        .saturating_sub(rows)
+        .min(total.saturating_sub(rows));
+    for i in 0..rows.min(total - offset) {
+        let idx = offset + i;
+        let y = inner.y + 2 + i as u16;
+        let sel = idx == app.cursor;
+        if sel {
+            pen.fill(Rect::new(inner.x, y, inner.width, 1), t.sel);
+        }
+        let (name, color) = if idx == 0 {
+            ("(whole device)".to_string(), t.purple)
+        } else {
+            (list[idx - 1].clone(), t.fg)
+        };
+        let current = if idx == 0 {
+            app.package().is_none()
+        } else {
+            app.package() == Some(name.as_str())
+        };
+        pen.segs(
+            inner.x + 1,
+            y,
+            &[
+                (if current { "● " } else { "  " }, t.green, false),
+                (&name, color, sel),
+            ],
+            inner.right(),
+        );
     }
 }
 
-fn centered_rect(px: u16, py: u16, r: Rect) -> Rect {
-    let v = Layout::default().direction(Direction::Vertical)
-        .constraints([Constraint::Percentage((100-py)/2), Constraint::Percentage(py), Constraint::Percentage((100-py)/2)])
-        .split(r);
-    Layout::default().direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage((100-px)/2), Constraint::Percentage(px), Constraint::Percentage((100-px)/2)])
-        .split(v[1])[1]
+fn marker_popup(pen: &mut Pen, app: &App, area: Rect) {
+    let t = pen.t;
+    let r = centered(area, 56, 5);
+    pen.clear(r);
+    let inner = pen.panel(
+        r,
+        &[("Add marker", t.yellow, true)],
+        &[
+            ("enter", t.yellow, false),
+            (" add  ", t.dim, false),
+            ("esc", t.yellow, false),
+            (" cancel", t.dim, false),
+        ],
+        Some(t.yellow),
+    );
+    let default = format!("m{}", app.session.markers.len() + 1);
+    let shown = if app.input.is_empty() {
+        default.as_str()
+    } else {
+        app.input.as_str()
+    };
+    pen.segs(
+        inner.x + 1,
+        inner.y + 1,
+        &[
+            ("label › ", t.dim, false),
+            (
+                shown,
+                if app.input.is_empty() { t.dim } else { t.fg },
+                false,
+            ),
+            ("_", t.yellow, false),
+        ],
+        inner.right(),
+    );
 }
 
-#[cfg(test)]
-mod tests {
-    use super::truncate_str;
-
-    #[test]
-    fn truncate_handles_multibyte_names() {
-        assert_eq!(truncate_str("ابراهیم-thread", 6), "ابر...");
-        assert_eq!(truncate_str("名前", 1), "名");
-        assert_eq!(truncate_str("main", 10), "main");
+fn help_popup(pen: &mut Pen, _app: &App, area: Rect) {
+    let t = pen.t;
+    let r = centered(area, 82, 30);
+    pen.clear(r);
+    let inner = pen.panel(
+        r,
+        &[("Keys", t.yellow, true)],
+        &[("any key closes", t.dim, false)],
+        Some(t.yellow),
+    );
+    let rows: &[(&str, &str)] = &[
+        ("1-6  tab  shift+tab", "switch pages"),
+        ("esc", "back to Overview, or clear the table filter"),
+        ("p / x", "pick an app / measure the whole device"),
+        ("d", "pick a device"),
+        (
+            "a",
+            "actions: launch, cold restart, force stop, doze, bucket…",
+        ),
+        (":", "run any adb command on this device; output streams in"),
+        (
+            "z / b / u",
+            "Power page: force Doze, next standby bucket, fake unplug",
+        ),
+        ("r", "Frames page: reset frame stats"),
+        ("c", "start or stop the network capture agent"),
+        ("m / M", "drop a marker now / with a label"),
+        ("w", "chart window: 1, 2, 5, 15, 30 min"),
+        ("space", "pause"),
+        ("s", "sort the table on this page"),
+        ("g", "group threads into pools (CPU page)"),
+        ("/", "filter the table on this page"),
+        ("↑ ↓ pgup pgdn home", "scroll the table"),
+        ("e", "export a JSON report of this session"),
+        ("t / T", "next / previous theme"),
+        (",", "settings (saved to ~/.config/android-perf-monitor)"),
+        ("q  ctrl+c", "quit (stops the capture agent)"),
+        ("", ""),
+        ("headless", "android-perf-monitor record --help"),
+    ];
+    for (i, (k, v)) in rows.iter().enumerate() {
+        let y = inner.y + 1 + i as u16;
+        if y >= inner.bottom() {
+            break;
+        }
+        pen.segs(
+            inner.x + 2,
+            y,
+            &[(&pad(k, 22), t.yellow, false), (v, t.fg, false)],
+            inner.right(),
+        );
     }
+}
+
+fn settings_popup(pen: &mut Pen, app: &App, area: Rect) {
+    let t = pen.t;
+    let rows = settings_rows(app);
+    let sections = rows.iter().filter(|r| !r.section.is_empty()).count() as u16;
+    let needed = rows.len() as u16 + sections * 2 + 4;
+    let r = centered(area, 156, needed.max(app.themes.len() as u16 + 10));
+    pen.clear(r);
+    let path = crate::config::path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let saved = format!("saved to {path}");
+    let inner = pen.panel(
+        r,
+        &[("Settings", t.yellow, true)],
+        &[(&saved, t.dim, false)],
+        Some(t.yellow),
+    );
+    if inner.height < 10 {
+        return;
+    }
+    let gap = inner.height >= rows.len() as u16 + sections * 2 + 2;
+    let left_w = (inner.width * 58 / 100).max(50).min(inner.width);
+    let right_x = inner.x + left_w + 2;
+    let label_x = inner.x + 3;
+    let value_x = inner.x + 24;
+    let mut y = inner.y + if gap { 1 } else { 0 };
+    for (i, row) in rows.iter().enumerate() {
+        if !row.section.is_empty() {
+            if i > 0 && gap {
+                y += 1;
+            }
+            pen.text(label_x, y, row.section, t.dim, true, inner.x + left_w);
+            y += 1;
+        }
+        if y >= inner.bottom() - 2 {
+            break;
+        }
+        let sel = i == app.cursor;
+        if sel {
+            pen.fill(Rect::new(inner.x, y, left_w, 1), t.sel);
+            pen.text(label_x - 2, y, "▸", t.yellow, true, inner.x + left_w);
+        }
+        pen.text(label_x, y, row.label, t.fg, false, value_x);
+        let mut x = value_x;
+        if sel {
+            x = pen.text(x, y, "◂ ", t.yellow, false, inner.x + left_w);
+        }
+        x = pen.text(
+            x,
+            y,
+            &row.value,
+            if sel { t.yellow } else { t.aqua },
+            sel,
+            inner.x + left_w,
+        );
+        if sel {
+            x = pen.text(x, y, " ▸", t.yellow, false, inner.x + left_w);
+        }
+        if !row.note.is_empty() {
+            pen.text(x + 2, y, row.note, t.dim, false, inner.x + left_w);
+        }
+        y += 1;
+    }
+    if right_x + 30 < inner.right() {
+        for yy in inner.y..inner.bottom() {
+            pen.put(right_x - 2, yy, "│", t.dim2);
+        }
+        pen.text(right_x, inner.y + 1, "THEMES", t.dim, true, inner.right());
+        pen.text(
+            right_x + 20,
+            inner.y + 1,
+            "bg     text accents",
+            t.dim,
+            false,
+            inner.right(),
+        );
+        let room = inner.height.saturating_sub(7);
+        let step = if app.themes.len() as u16 * 2 <= room {
+            2
+        } else {
+            1
+        };
+        let first = if app.themes.len() as u16 > room {
+            (app.theme as u16 + 1).saturating_sub(room) as usize
+        } else {
+            0
+        };
+        for (i, th) in app.themes.iter().enumerate().skip(first) {
+            let yy = inner.y + 2 + (i - first) as u16 * step;
+            if yy >= inner.bottom() - 4 {
+                break;
+            }
+            let on = i == app.theme;
+            if on {
+                pen.fill(
+                    Rect::new(right_x - 1, yy, inner.right() - right_x + 1, 1),
+                    t.sel,
+                );
+            }
+            pen.segs(
+                right_x,
+                yy,
+                &[
+                    (
+                        if on { "● " } else { "○ " },
+                        if on { t.yellow } else { t.dim },
+                        on,
+                    ),
+                    (&trunc(&th.name, 17), if on { t.yellow } else { t.fg }, on),
+                ],
+                right_x + 20,
+            );
+            let mut sx = right_x + 20;
+            for (k, c) in th.swatches().iter().enumerate() {
+                for _ in 0..3 {
+                    pen.bg(sx, yy, *c);
+                    sx += 1;
+                }
+                if k == 1 || k == 2 {
+                    sx += 1;
+                }
+            }
+        }
+        let hint_y = inner.bottom() - 4;
+        pen.text(
+            right_x,
+            hint_y,
+            "The screen behind shows the selected theme.",
+            t.dim,
+            false,
+            inner.right(),
+        );
+        pen.segs(
+            right_x,
+            hint_y + 1,
+            &[
+                ("Add your own: ", t.dim, false),
+                ("[themes.mine]", t.purple, false),
+                (" in config.toml", t.dim, false),
+            ],
+            inner.right(),
+        );
+        pen.segs(
+            right_x,
+            hint_y + 2,
+            &[
+                ("with ", t.dim, false),
+                ("base = \"nord\"", t.fg, false),
+                (" and any of bg, fg, accent…", t.dim, false),
+            ],
+            inner.right(),
+        );
+    }
+    pen.segs(
+        inner.x + 2,
+        inner.bottom() - 1,
+        &[
+            ("↑↓", t.yellow, false),
+            (" move   ", t.dim, false),
+            ("←→ enter", t.yellow, false),
+            (" change   ", t.dim, false),
+            ("r", t.yellow, false),
+            (" defaults   ", t.dim, false),
+            ("esc", t.yellow, false),
+            (" save and close", t.dim, false),
+        ],
+        inner.right(),
+    );
 }
