@@ -666,7 +666,7 @@ fn process_memory_table(pen: &mut Pen, app: &App, area: Rect) {
                 || p.id.to_string().contains(&filter)
         })
         .collect();
-    rows.sort_by(|a, b| b.0.rss_pages.cmp(&a.0.rss_pages));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0.rss_pages));
     let top_kb = rows.first().map_or(1, |r| r.0.rss_pages * page_kb).max(1);
     let visible = (area.height - 1) as usize;
     let offset = app.scroll[app.page].min(rows.len().saturating_sub(visible));
@@ -3694,7 +3694,7 @@ fn connections_table(pen: &mut Pen, app: &App, area: Rect) {
         .filter(|c| f.is_empty() || c.host.to_lowercase().contains(&f) || c.remote.contains(&f))
         .collect();
     match app.sort {
-        Sort::Bytes => conns.sort_by(|a, b| (b.rx + b.tx).cmp(&(a.rx + a.tx))),
+        Sort::Bytes => conns.sort_by_key(|c| std::cmp::Reverse(c.rx + c.tx)),
         Sort::Name => conns.sort_by(|a, b| a.host.cmp(&b.host)),
         _ => {}
     }

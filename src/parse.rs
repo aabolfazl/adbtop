@@ -1342,7 +1342,7 @@ pub fn parse_jobs(output: &str, package: &str) -> Jobs {
     }
     jobs.recent.reverse();
     jobs.recent.truncate(12);
-    services.sort_by(|a, b| b.count.cmp(&a.count));
+    services.sort_by_key(|s| std::cmp::Reverse(s.count));
     jobs.services = services;
     jobs
 }
