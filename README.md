@@ -1,85 +1,177 @@
-# Android Performance Monitor
+# adbtop
 
-A terminal performance monitor for Android apps and devices, over ADB, without root. It has two modes:
+**Live performance for Android apps, in your terminal and your CI.**
 
-- **Interactive TUI:** six pages of live charts (CPU, memory, frames, network, power) with markers, themes and settings.
-- **Headless CLI:** records the same data and writes JSON, so scripts, CI jobs and AI agents can use it.
+CPU, memory, frames, network and power for one app or the whole phone, over adb. No root, nothing to add to your app, no Android Studio.
 
-![Screenshot](assets/screenshot.png)
+![adbtop overview](assets/overview.png)
 
-## Requirements
+- **CPU**: app vs system, kernel time, a per-core heatmap grouped by cluster, clock speeds and throttling caps, every thread with its state and history, thread pools
+- **Memory**: PSS by category over time, Java heap and GC, Activities, Views and AppContexts with their change since start (leak hints), SQLite
+- **Frames**: every frame against the vsync budget, FPS, jank %, percentiles and what caused the jank
+- **Network**: traffic per app, every connection with its host name (TLS SNI, DNS or HTTP), DNS lookups and why connections failed, through a small [agent app](android-agent/README.md) that works like a local VPN
+- **Power**: battery drain in mA and W, mAh used, every thermal sensor, throttling, Doze, standby bucket, jobs and alarms
+- **Headless**: `record` and `snapshot` print JSON or CSV, markers measure a single action, `--assert` fails a CI job on a regression. Built to be driven by scripts and AI agents.
 
-- [Rust](https://rustup.rs/) 1.78+
-- [ADB](https://developer.android.com/tools/adb) on your `PATH`
-- An Android device with **USB debugging** enabled (Android 6+; frame stats, thermal status and memory pressure need newer versions)
+When the phone can't provide something, the panel says **not supported on this device** and why, instead of showing zeros.
 
-```bash
-git clone https://github.com/aabolfazl/android-perf.git
-cd android-perf
-cargo build --release
-```
+## Install
 
-The binary is `target/release/android-perf-monitor`.
+You need [adb](https://developer.android.com/tools/adb) on your `PATH` and a phone with **USB debugging** on. Android 6 or newer; frame stats, thermal status and memory pressure need newer versions.
 
-## TUI
+### macOS
 
 ```bash
-android-perf-monitor                      # pick a device and an app inside the UI
-android-perf-monitor -p com.example.app   # start on one app
-android-perf-monitor --theme "tokyo night"
+brew install aabolfazl/tap/adbtop
 ```
 
-| Page | What it shows |
+### Linux
+
+```bash
+curl -LsSf https://github.com/aabolfazl/adbtop/releases/latest/download/adbtop-installer.sh | sh
+```
+
+The script also works on macOS. It puts `adbtop` in `~/.local/bin`. Prebuilt binaries for both are on the [releases page](https://github.com/aabolfazl/adbtop/releases).
+
+### With Cargo
+
+```bash
+cargo install adbtop
+```
+
+### From source
+
+```bash
+git clone https://github.com/aabolfazl/adbtop.git
+cd adbtop
+cargo build --release      # target/release/adbtop, needs Rust 1.78+
+```
+
+A source build doesn't include the capture agent. Build it with Gradle ([agent README](android-agent/README.md)) and install it with `adbtop agent install --apk <path>`.
+
+## Use
+
+```bash
+adbtop                          # pick a device and an app inside the UI
+adbtop -p com.example.app       # start on one app
+adbtop -p com.example.app --capture   # with per-app network capture
+```
+
+| CPU | Memory |
 |---|---|
-| 1 Overview | One tile per page, each with a chart and the key numbers |
-| 2 CPU | App vs system CPU, the app's kernel time, a per-core heatmap grouped by cluster (little/mid/big/prime), cluster clock speeds and caps, threads with state, average, peak and 2-minute history, thread pools |
-| 3 Memory | App-owned PSS by category over time, Java heap size vs allocated (GC drops), Activities/Views/AppContexts/Binders with their change since start, SQLite databases and statement-cache hit rate, device RAM and swap |
-| 4 Frames | Time of every frame against the vsync budget, FPS, jank %, percentiles, jank causes and distribution (from `dumpsys gfxinfo framestats`) |
-| 5 Network | Received/sent per second; with the [capture agent](android-agent/README.md): top hosts, DNS lookups and every connection with where its name came from (SNI/DNS/HTTP) and why it failed |
-| 6 Power | Battery current (drain in mA and W), mAh used this session, all thermal sensors, throttling status, doze and standby bucket, jobs and alarms |
+| ![CPU](assets/cpu.png) | ![Memory](assets/memory.png) |
+| **Frames** | **Network** |
+| ![Frames](assets/frames.png) | ![Network](assets/network.png) |
 
-Every panel says **not supported on this device** (with the reason) when the phone can't provide that data.
-
-Changes the TUI makes to the phone (forced Doze, fake unplug, a different standby bucket) show as a ⚠ badge in the status bar. They are undone when you quit or switch devices.
-
-The network capture (VPN) stops whenever the TUI exits: on `q` or Ctrl+C, when the terminal is closed, on SIGTERM, and after a crash. If the monitor disappears without a chance to clean up (`kill -9`, cable unplugged, laptop asleep), the agent stops itself once no monitor has been connected for 30 s.
+### Keys
 
 | Key | Action |
 |---|---|
-| `1`–`6`, `Tab`, `Shift+Tab` | Switch pages (`Esc` goes back to Overview) |
-| `p` / `x` | Pick an app / measure the whole device |
-| `d` | Pick a device |
-| `m` / `M` | Drop a marker on every chart now / with a label |
+| `1`–`6`, `Tab` | Overview, CPU, Memory, Frames, Network, Power |
+| `p` / `x` / `d` | Pick an app / watch the whole device / pick a device |
+| `m` / `M` | Drop a marker on every chart / with a label |
 | `w` | Chart window: 1, 2, 5, 15, 30 minutes |
-| `Space` | Pause |
-| `c` | Start or stop the network capture agent |
-| `a` | Actions: launch, cold restart (measures the start time and adds a marker), force stop, reset frame stats, Doze, standby bucket, fake unplug |
-| `:` | Run any adb command on the selected device; the output streams into a scrollable window (`Esc` stops long commands like `logcat`) |
-| `z` / `b` / `u` | Power page: force Doze on/off, next standby bucket, fake unplug |
-| `r` | Frames page: reset frame stats |
-| `s`, `g`, `/`, `↑↓` | Sort, group thread pools, filter, scroll the table on this page |
+| `c` | Start or stop the network capture |
+| `a` | Actions: launch, cold start (measured and marked), force stop, reset frame stats, Doze, standby bucket, fake unplug, install the capture agent |
+| `:` | Run any adb command on this device, with the output in a scrollable window |
+| `s`, `g`, `/`, `↑↓` | Sort, group thread pools, filter, scroll |
 | `e` | Save a JSON report of this session |
-| `t` / `T` | Next / previous theme |
-| `,` | Settings |
-| `?` | Help |
-| `q`, `Ctrl+C` | Quit (stops the capture agent) |
+| `t`, `,`, `?` | Next theme, settings, help |
+| `Space`, `q` | Pause, quit |
 
-### Settings and themes
+Anything adbtop changes on the phone (forced Doze, fake unplug, standby bucket) shows as a ⚠ badge and is undone when you quit or switch devices. The network capture stops when adbtop exits, and the agent stops itself if adbtop dies without cleaning up.
 
-Settings live in `~/.config/android-perf-monitor/config.toml` (or under `$XDG_CONFIG_HOME`). Edit them with `,` in the TUI or by hand. Command-line flags override them.
+### Network capture
 
-| Setting | What it changes |
+Per-app connections need the agent app on the phone. adbtop installs the version that matches it:
+
+```bash
+adbtop agent install
+```
+
+The first capture asks for VPN permission on the phone once. Traffic is not sent anywhere: the agent forwards it to where it was going and measures it on the way. HTTPS stays encrypted; you see where it goes, not what is in it. Details in the [agent README](android-agent/README.md).
+
+## Scripts, CI and AI agents
+
+Every command prints JSON on stdout and progress on stderr, and never asks for input.
+
+```bash
+adbtop record -p com.example.app --duration 60s > report.json
+adbtop record -p com.example.app -m cpu,memory --samples - -o report.json   # one JSON line per second
+adbtop record -p com.example.app --duration 5m --samples samples.csv -o report.json
+adbtop snapshot -p com.example.app
+adbtop devices
+adbtop packages
+```
+
+Measure one action, for example from an agent that drives the phone:
+
+```bash
+adbtop record -p com.example.app -o login.json &
+adb shell input tap 540 1680
+adbtop mark "tapped login"
+sleep 15
+adbtop stop
+```
+
+The report's `after_markers` section shows what followed each marker: peak CPU, PSS change, bytes downloaded, janky frames and battery drain.
+
+Fail a CI job on a regression. Each `--assert` is `PATH OP NUMBER` over the report:
+
+```bash
+adbtop record -p com.example.app --duration 2m \
+  --assert 'frames.janky_pct < 5' \
+  --assert 'memory.pss_mb.growth_per_min < 0.5' \
+  --assert 'network.failed == 0' \
+  -o ci.json
+```
+
+### Claude Code and Codex
+
+One command teaches your coding agent to use adbtop: which commands to run, how to measure a single action, and how to read the report.
+
+```bash
+adbtop skill install            # Claude Code and Codex, whichever you have
+adbtop skill install --claude   # only one of them
+```
+
+Then ask in plain words, for example "check whether com.example.app leaks memory when I open and close the settings screen". The skill is [`skills/adbtop/SKILL.md`](skills/adbtop/SKILL.md); `adbtop skill uninstall` removes it. In Codex you can also install it from GitHub with `$skill-installer https://github.com/aabolfazl/adbtop/tree/master/skills/adbtop`.
+
+### Report
+
+`"schema": "adbtop/report@1"`
+
+| Section | Contents |
 |---|---|
-| Theme, graph style, key hints, start page | Look, braille or block charts (for fonts without braille), footer shortcuts, the page shown at start |
-| CPU % | App and system CPU as a share of all cores, or top-style % of one core |
-| Temperature | °C or °F |
-| Chart window, memory chart, network scale | Default time span; stacked app-owned memory or full PSS with shared Code/System; √ or linear network axis |
-| Hide idle threads | Drop threads that never used CPU from the tables |
-| Interval, memory interval, keep history | Sampling rates and how long history is kept |
-| Frames, network capture, battery & thermal, process list | Turn collectors off to reduce load on the phone |
-| Reopen last app, report folder, export on quit | Start on the last app; where `e` and export-on-quit save JSON reports |
+| `device`, `app`, `session` | Model, Android version, CPU clusters; package, pid, restarts; start, duration, samples |
+| `unsupported` | What this phone can't provide, and why |
+| `cpu` | App, kernel and system % (avg, min, max, p95, last), per core, cluster clocks and caps, top threads |
+| `memory` | PSS with `growth_per_min`, PSS by category, Java heap and GC estimate, object counts at start and end, SQLite, device RAM and pressure |
+| `frames` | Frames, janky %, p50–p99, GPU percentiles, refresh rate, FPS, jank causes |
+| `network` | Bytes, rates, connections, failures, top hosts, DNS failures |
+| `power` | Battery, `drain_ma`, `used_mah`, thermal status and peak per sensor, Doze, jobs |
+| `markers`, `after_markers` | Markers and what followed each one |
+| `warnings` | Plain sentences with numbers: PSS growing, AppContexts growing while Activities stay flat, failing hosts, throttling, phone plugged in |
+| `assertions` | Each check, its value and whether it passed |
 
-Built-in themes: Gruvbox Dark (default), Catppuccin Mocha, Tokyo Night, Nord, Dracula, One Dark, Solarized Dark, Kanagawa, Everforest Dark, Monokai, GitHub Dark, Ayu Dark, Night Owl, Catppuccin Latte (light). To add your own:
+App and system CPU are shares of all cores (100 = every core busy); thread CPU is % of one core.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | OK |
+| 1 | Error |
+| 2 | Bad arguments |
+| 3 | An `--assert` failed |
+| 4 | Device or app not found, device not authorized, or several devices and no `-d` |
+| 5 | Capture agent missing or not allowed |
+
+Errors are printed as `{"error": {"code": "...", "message": "..."}}`.
+
+## Settings and themes
+
+`,` opens the settings; they are saved in `~/.config/adbtop/config.toml`. Command-line flags override them. You can set the theme, braille or block charts, the start page, CPU % as a share of all cores or of one core, °C or °F, the chart window, sampling rates, history length, and turn off collectors you don't need to reduce load on the phone.
+
+14 themes are built in (`adbtop themes`): Gruvbox Dark, Catppuccin Mocha, Tokyo Night, Nord, Dracula, One Dark, Solarized Dark, Kanagawa, Everforest Dark, Monokai, GitHub Dark, Ayu Dark, Night Owl and Catppuccin Latte. Add your own on top of one:
 
 ```toml
 [themes.mine]
@@ -88,96 +180,18 @@ bg = "#101418"
 accent = "#ffcc66"
 ```
 
-The roles you can set are `bg`, `hi`, `fg`, `dim`, `dim2`, `gray`, `track`, `sel`, `red`, `green`, `yellow`, `blue`, `purple`, `aqua` and `orange`; any you leave out come from `base`.
+## Good to know
 
-## Headless: scripts, CI and AI agents
-
-Every command prints JSON on stdout; progress messages go to stderr. Nothing asks for input.
-
-```bash
-# record 60 s of everything for one app, then print the report
-android-perf-monitor record -p com.example.app --duration 60s > report.json
-
-# only some metrics, report to a file, one JSON line per second on stdout
-android-perf-monitor record -p com.example.app -m cpu,memory -o report.json --samples -
-
-# samples as CSV
-android-perf-monitor record -p com.example.app --duration 5m --samples samples.csv -o report.json
-
-# current values, one sample
-android-perf-monitor snapshot -p com.example.app
-
-android-perf-monitor devices
-android-perf-monitor packages
-android-perf-monitor themes
-```
-
-Measuring one action, e.g. from an agent that drives the phone:
-
-```bash
-android-perf-monitor record -p com.example.app -o login.json &
-adb shell input tap 540 1680
-android-perf-monitor mark "tapped login"
-sleep 15
-android-perf-monitor stop
-```
-
-The report's `after_markers` section summarises what happened in the seconds after each marker (`--after-marker 15s` by default): peak app CPU, PSS change, bytes downloaded, janky frames and battery drain.
-
-Regression checks: each `--assert` is `PATH OP NUMBER` over the report's JSON, with `<`, `<=`, `>`, `>=`, `==` or `!=`:
-
-```bash
-android-perf-monitor record -p com.example.app --duration 2m \
-  --assert 'frames.janky_pct < 5' \
-  --assert 'memory.pss_mb.growth_per_min < 0.5' \
-  --assert 'network.failed == 0' \
-  -o ci.json
-```
-
-### Report
-
-`"schema": "android-perf-monitor/report@1"`. The main sections:
-
-| Section | Contents |
-|---|---|
-| `device`, `app`, `session` | Model, Android version, CPU clusters; package, pid, state and restarts; start time, duration, samples |
-| `unsupported` | Data sources this device can't provide, with the reason |
-| `cpu` | `app_pct`, `app_kernel_pct`, `system_pct` (avg/min/max/p95/last), per-core averages, cluster clock speeds and caps, top threads |
-| `memory` | `pss_mb` with `growth_per_min`, PSS by category, Java heap and a GC estimate, object counts `[start, end]`, SQLite, device RAM and memory pressure |
-| `frames` | Frames rendered and janky, `janky_pct`, p50–p99, GPU percentiles, refresh rate, FPS, jank causes |
-| `network` | Source (`capture` or `device`), bytes, rates, connections, failures, top hosts, DNS failures |
-| `power` | Battery level, status and plugged state, `drain_ma`, `used_mah`, thermal status and peak temperature per sensor, doze, jobs |
-| `markers`, `after_markers` | Markers and what followed each one |
-| `warnings` | Plain sentences with numbers, e.g. a PSS growth trend, AppContexts growing while Activities stay flat, failed hosts, throttling, a plugged-in phone |
-| `assertions` | Each check with its value and whether it passed |
-
-CPU percentages for the app and the system are shares of all cores (100 = every core busy); thread values are % of one core.
-
-### Exit codes
-
-| Code | Meaning |
-|---|---|
-| 0 | OK |
-| 1 | Error (adb missing, cannot write the report, no running recording for `mark`/`stop`) |
-| 2 | Bad arguments |
-| 3 | An `--assert` failed |
-| 4 | Device or app not found, device not authorized, or more than one device without `-d` |
-| 5 | Capture agent missing or not allowed |
-
-Errors are printed as `{"error": {"code": "...", "message": "..."}}`.
-
-## Notes
-
-- While the phone is plugged in it charges, so battery current is not your app's drain. Measure power over Wi-Fi adb (`adb tcpip 5555`).
+- A phone on USB charges, so the battery current is not your app's drain. Measure power over Wi-Fi adb (`adb tcpip 5555`).
+- `dumpsys meminfo` takes about 0.4 s on the phone, so app memory is sampled every 2 s.
+- Android keeps the last ~120 frames, so at 120 Hz a few can be missed between samples. Jank % and percentiles come from Android's own counters and are exact.
 - Linux cuts thread names to 15 characters.
-- `dumpsys meminfo` takes about 0.4 s on the phone, so app memory is sampled every 2 s by default.
-- Android keeps only the last ~120 frames per window, so at 120 Hz a few frames can be missed between samples; the jank percentages and percentiles come from Android's own counters and are exact.
 
 ## How it works
 
-The fast metrics (`/proc` CPU, threads, memory, network, CPU clocks) come from a single `grep` over all the files each interval, through a persistent `adb shell`. `dumpsys meminfo`, `dumpsys gfxinfo` and the slower services each run on their own persistent shell, so a slow command never delays the others. At startup a probe reads the Android version, the CPU clusters and which services exist; anything missing is marked as unsupported. All of this feeds one session that keeps the history and computes the statistics; the TUI, the JSON report and the per-sample stream all read from it.
+All the fast `/proc` reads (CPU, threads, memory, network, clocks) are one `grep` per interval over a persistent `adb shell`. `dumpsys meminfo`, `dumpsys gfxinfo` and the slower services each have their own shell, so a slow command never delays the others. At startup a probe reads the Android version, the CPU clusters and which services exist. Everything feeds one session that keeps the history; the TUI, the JSON report and the sample stream all read from it.
 
-For network capture, the [agent app](android-agent/README.md) runs a local VPN on the phone and streams protobuf snapshots ([`proto/agent.proto`](proto/agent.proto)) over `adb forward`.
+The [agent app](android-agent/README.md) runs a local VPN on the phone and streams protobuf snapshots ([`proto/agent.proto`](proto/agent.proto)) over `adb forward`.
 
 ## License
 
