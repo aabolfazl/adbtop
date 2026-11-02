@@ -10,7 +10,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Android Perf Agent"
+        android:label="adbtop agent"
         tools:ignore="MissingApplicationIcon">
 
         <!-- Started from the computer: adb shell am start -n io.github.aabolfazl.perfagent/.ControlActivity -->

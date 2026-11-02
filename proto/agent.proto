@@ -1,6 +1,6 @@
 // Wire format between the on-device agent (android-agent/) and the terminal UI.
 //
-// The agent listens on the abstract unix socket "android-perf-agent" and sends one
+// The agent listens on the abstract unix socket "adbtop-agent" and sends one
 // length-delimited Snapshot (varint size prefix, then the message) every second.
 syntax = "proto3";
 

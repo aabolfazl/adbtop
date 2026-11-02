@@ -14,7 +14,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "android-perf-agent"
+rootProject.name = "adbtop-agent"
 
 // The engine is a separate build so it can be built and tested without the Android SDK.
 includeBuild("engine")

@@ -7,9 +7,9 @@ use crate::collect::Groups;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "android-perf-monitor",
+    name = "adbtop",
     version,
-    about = "Android performance monitor: an interactive TUI, or headless recording that writes JSON for scripts, CI and AI agents",
+    about = "Live performance for Android apps over adb: an interactive TUI, or headless recording that writes JSON for scripts, CI and AI agents",
     after_help = "Without a subcommand the interactive TUI starts.\n\nExit codes: 0 ok, 1 error, 2 bad arguments, 3 an --assert failed, 4 device or app not found, 5 capture agent missing or not allowed."
 )]
 pub struct Cli {
@@ -19,7 +19,7 @@ pub struct Cli {
     pub common: Common,
     #[arg(
         long,
-        help = "TUI color theme, e.g. \"tokyo night\" (list: android-perf-monitor themes)"
+        help = "TUI color theme, e.g. \"tokyo night\" (list: adbtop themes)"
     )]
     pub theme: Option<String>,
 }
@@ -41,7 +41,7 @@ pub struct Common {
     #[arg(
         long,
         global = true,
-        help = "Start the on-device network capture agent (android-agent/)"
+        help = "Start the on-device network capture agent (install it with `adbtop agent install`)"
     )]
     pub capture: bool,
     #[arg(
@@ -81,6 +81,62 @@ pub enum Command {
     Packages,
     #[command(about = "List the TUI color themes as JSON")]
     Themes,
+    #[command(about = "Install, check or remove the network capture agent on the phone")]
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+    #[command(about = "Teach AI coding agents (Claude Code, Codex) to use adbtop")]
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillAction {
+    #[command(
+        about = "Install or update the adbtop skill for Claude Code and Codex (every one found on this computer, or the ones you pick)"
+    )]
+    Install {
+        #[arg(
+            long,
+            help = "Claude Code: $CLAUDE_CONFIG_DIR/skills or ~/.claude/skills"
+        )]
+        claude: bool,
+        #[arg(long, help = "Codex: $CODEX_HOME/skills or ~/.codex/skills")]
+        codex: bool,
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Also write DIR/adbtop/SKILL.md, for other agents that read SKILL.md files"
+        )]
+        dest: Option<PathBuf>,
+    },
+    #[command(about = "Remove the adbtop skill from Claude Code and Codex")]
+    Uninstall,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentAction {
+    #[command(about = "Install or update the agent that matches this adbtop")]
+    Install {
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Install this APK instead of the bundled one"
+        )]
+        apk: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Remove an agent signed with a different key first (the phone asks for the VPN permission again)"
+        )]
+        replace: bool,
+    },
+    #[command(about = "Show the installed agent version and whether it may start the VPN")]
+    Status,
+    #[command(about = "Remove the agent from the phone")]
+    Uninstall,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -220,7 +276,7 @@ mod tests {
     #[test]
     fn cli_parses_record() {
         let cli = Cli::try_parse_from([
-            "apm",
+            "adbtop",
             "record",
             "-p",
             "com.example.app",

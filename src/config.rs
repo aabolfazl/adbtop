@@ -131,7 +131,7 @@ pub fn path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| home().map(|h| h.join(".config")))?;
-    Some(base.join("android-perf-monitor").join("config.toml"))
+    Some(base.join("adbtop").join("config.toml"))
 }
 
 pub fn home() -> Option<PathBuf> {

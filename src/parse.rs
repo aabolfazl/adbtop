@@ -84,7 +84,7 @@ pub fn probe_command() -> &'static str {
     "getprop ro.build.version.sdk; getprop ro.build.version.release; getprop ro.product.model; getprop ro.product.manufacturer; \
 echo ==C; grep -H '' /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq /sys/devices/system/cpu/cpu[0-9]*/cpufreq/related_cpus 2>/dev/null; \
 echo ==S; for s in gfxinfo thermalservice battery deviceidle jobscheduler meminfo; do service check $s; done; \
-echo ==P; [ -r /proc/pressure/memory ] && echo psi; [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ] && echo cpufreq; echo ==E"
+echo ==P; [ -r /proc/pressure/memory ] && echo psi; [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ] && echo cpufreq; echo page $(getconf PAGESIZE 2>/dev/null); echo ==E"
 }
 
 pub fn parse_probe(output: &str) -> Capabilities {
@@ -148,7 +148,11 @@ pub fn parse_probe(output: &str) -> Capabilities {
             3 => match line.trim() {
                 "psi" => caps.psi = true,
                 "cpufreq" => caps.cpufreq = true,
-                _ => {}
+                other => {
+                    if let Some(size) = other.strip_prefix("page ").and_then(num) {
+                        caps.page_size = size;
+                    }
+                }
             },
             _ => {}
         }
@@ -229,6 +233,7 @@ pub struct ProcStat<'a> {
     pub nice: i32,
     pub threads: u32,
     pub start: u64,
+    pub rss_pages: u64,
     pub processor: u16,
 }
 
@@ -261,6 +266,7 @@ pub fn parse_proc_stat(line: &str) -> Option<ProcStat<'_>> {
         nice: rest[16] as i32,
         threads: rest[17] as u32,
         start: rest[19] as u64,
+        rss_pages: rest[21].max(0) as u64,
         processor: rest[36] as u16,
     })
 }
@@ -601,6 +607,8 @@ impl FastParser {
                 oom_adj,
                 nice: stat.nice,
                 uptime_s: (uptime - stat.start as f64 / USER_HZ).max(0.0),
+                cpu: f32::NAN,
+                kernel: f32::NAN,
                 ..Default::default()
             };
             restarted = self.identity.is_some_and(|id| id != (now.pid, now.start));
@@ -648,6 +656,7 @@ impl FastParser {
                 cpu,
                 core: stat.processor,
                 ticks,
+                rss_pages: stat.rss_pages,
             });
         }
         self.tasks = next_ticks;
@@ -662,7 +671,6 @@ impl FastParser {
 
         FastResult {
             sample: Some(FastSample {
-                dt: (d_total as f64 / online / USER_HZ) as f32,
                 cores,
                 sys_cpu,
                 mem: mem_seen.then_some(mem),
@@ -938,7 +946,19 @@ impl FrameParser {
     }
 
     pub fn parse(&mut self, output: &str) -> Option<FrameUpdate> {
-        let mut update = FrameUpdate::default();
+        let (output, uptime) = match output.rsplit_once("==U") {
+            Some((body, tail)) => (
+                body,
+                tail.split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<f64>().ok()),
+            ),
+            None => (output, None),
+        };
+        let mut update = FrameUpdate {
+            uptime_s: uptime,
+            ..FrameUpdate::default()
+        };
         let mut found = false;
         let mut columns: Option<FrameColumns> = None;
         let mut frames: Vec<Frame> = Vec::new();
@@ -1447,7 +1467,7 @@ mod tests {
         ));
         let s = p.parse(&out, true, Some(4321)).sample.unwrap();
         assert!(s.restarted);
-        assert_eq!(s.app.unwrap().cpu, 0.0);
+        assert!(s.app.unwrap().cpu.is_nan());
     }
 
     #[test]
@@ -1662,6 +1682,11 @@ Flags,FrameTimelineVsyncId,IntendedVsync,Vsync,InputEventId,HandleInputStart,Ani
         let mut p = FrameParser::default();
         let u = p.parse(GFX).unwrap();
         assert_eq!(u.pid, 4321);
+        assert_eq!(u.uptime_s, None);
+        let with_uptime = format!("{GFX}==U\n67123.45 501234.00\n");
+        let u2 = FrameParser::default().parse(&with_uptime).unwrap();
+        assert_eq!(u2.uptime_s, Some(67123.45));
+        assert_eq!(u2.summary.total, 2832);
         assert_eq!(
             (u.summary.total, u.summary.janky, u.summary.janky_legacy),
             (2832, 76, 102)

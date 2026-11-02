@@ -5,6 +5,18 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val adbtopVersion: String = rootDir.resolve("../Cargo.toml").readLines()
+    .first { it.startsWith("version = ") }
+    .substringAfter('"')
+    .substringBefore('"')
+
+fun versionCodeOf(version: String): Int {
+    val parts = version.substringBefore('-').substringBefore('+').split('.').map { it.toIntOrNull() ?: 0 }
+    return parts.getOrElse(0) { 0 } * 10_000 + parts.getOrElse(1) { 0 } * 100 + parts.getOrElse(2) { 0 }
+}
+
+val keystore: String? = System.getenv("ADBTOP_KEYSTORE")
+
 android {
     namespace = "io.github.aabolfazl.perfagent"
     compileSdk = 35
@@ -14,13 +26,29 @@ android {
         // getConnectionOwnerUid and DnsResolver need Android 10.
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = versionCodeOf(adbtopVersion)
+        versionName = adbtopVersion
+    }
+
+    signingConfigs {
+        if (keystore != null) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("ADBTOP_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ADBTOP_KEY_ALIAS") ?: "adbtop"
+                keyPassword = System.getenv("ADBTOP_KEY_PASSWORD") ?: System.getenv("ADBTOP_KEYSTORE_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (keystore != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

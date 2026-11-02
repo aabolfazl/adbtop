@@ -361,7 +361,7 @@ pub fn app_gate(app: &App) -> Option<&'static str> {
 fn tab_bar(pen: &mut Pen, app: &App, r: Rect) {
     let t = pen.t;
     pen.fill(r, t.hi);
-    let mut x = pen.text(r.x + 1, r.y, "◉ android-perf", t.yellow, true, r.right()) + 2;
+    let mut x = pen.text(r.x + 1, r.y, "◉ adbtop", t.yellow, true, r.right()) + 2;
     for (i, name) in PAGES.iter().enumerate() {
         let label = format!(" {} {} ", i + 1, name);
         let on = i == app.page;
@@ -420,7 +420,11 @@ fn status_bar(pen: &mut Pen, app: &App, r: Rect) {
     } else {
         ("● REC ", t.green, true)
     };
-    let ticks = format!("  #{} @{}", s.ticks, interval_label(s.interval_s()));
+    let ticks = format!(
+        "  #{} @{}",
+        s.ticks,
+        interval_label(s.interval.as_secs_f32())
+    );
     let window = xlabels(app.window_s)[0].trim_start_matches('-').to_string();
     let (mode_label, mode_value, mode_color) = match app.package() {
         Some(p) => ("PACKAGE ", p.to_string(), t.aqua),
@@ -863,10 +867,10 @@ fn help_popup(pen: &mut Pen, _app: &App, area: Rect) {
         ("↑ ↓ pgup pgdn home", "scroll the table"),
         ("e", "export a JSON report of this session"),
         ("t / T", "next / previous theme"),
-        (",", "settings (saved to ~/.config/android-perf-monitor)"),
+        (",", "settings (saved to ~/.config/adbtop)"),
         ("q  ctrl+c", "quit (stops the capture agent)"),
         ("", ""),
-        ("headless", "android-perf-monitor record --help"),
+        ("headless", "adbtop record --help"),
     ];
     for (i, (k, v)) in rows.iter().enumerate() {
         let y = inner.y + 1 + i as u16;

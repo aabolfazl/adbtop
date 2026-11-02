@@ -106,6 +106,7 @@ pub struct Capabilities {
     pub deviceidle: bool,
     pub jobscheduler: bool,
     pub meminfo: bool,
+    pub page_size: u32,
 }
 
 impl Capabilities {
@@ -196,6 +197,7 @@ pub struct TaskSample {
     pub cpu: f32,
     pub core: u16,
     pub ticks: u64,
+    pub rss_pages: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -209,7 +211,6 @@ pub enum AppState {
 
 #[derive(Debug, Clone, Default)]
 pub struct FastSample {
-    pub dt: f32,
     pub cores: Vec<CoreSample>,
     pub sys_cpu: f32,
     pub mem: Option<SysMem>,
@@ -315,6 +316,7 @@ pub struct FrameUpdate {
     pub baseline: bool,
     pub frames: Vec<Frame>,
     pub summary: FrameSummary,
+    pub uptime_s: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

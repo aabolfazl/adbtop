@@ -61,7 +61,7 @@ fn span_samples(app: &App, full: usize) -> usize {
 }
 
 fn span_secs(app: &App, n: usize) -> u32 {
-    (n as f32 * app.session.interval_s()).round() as u32
+    (n.saturating_sub(1) as f32 * app.session.interval_s()).round() as u32
 }
 
 impl Win {
@@ -221,7 +221,12 @@ fn cluster_color(t: &Theme, name: &str) -> Color {
         "mid" => t.blue,
         "big" => t.purple,
         "prime" => t.orange,
-        _ => t.fg,
+        other => {
+            let i = other.trim_start_matches('c').parse::<usize>().unwrap_or(0);
+            [
+                t.aqua, t.green, t.blue, t.yellow, t.purple, t.orange, t.red, t.fg,
+            ][i % 8]
+        }
     }
 }
 
@@ -371,10 +376,12 @@ fn tile_memory(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
         &[("Memory", t.yellow, true)],
         &[
             (
-                if app_mode {
-                    "app-owned PSS, MB "
-                } else {
+                if !app_mode {
                     "device RAM "
+                } else if app.config.memory_chart == MemChart::Full {
+                    "PSS, MB "
+                } else {
+                    "app-owned PSS, MB "
                 },
                 t.dim,
                 false,
@@ -390,7 +397,7 @@ fn tile_memory(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
     if app_mode {
         let (x, mut y, right) = (stats.x, stats.y, stats.right());
         let layers = app_layers(app, win.n);
-        stacked_chart(pen, app, chart, &layers, win);
+        stacked_chart(pen, app, chart, &layers, win, 10.0, "");
         let m = s.app_mem.as_ref().unwrap();
         pen.segs(
             x,
@@ -427,11 +434,11 @@ fn tile_memory(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
                 x,
                 y,
                 &[
-                    ("■ ", color, false),
+                    (swatch(app, name), color, false),
                     (&pad(name, 9), t.fg, false),
                     (&rpad(&format!("{:.1}", kb as f32 / 1024.0), 6), t.fg, false),
                     (
-                        &rpad(&format!("{d:+.1}"), 6),
+                        &rpad(&signed1(d), 6),
                         if d.abs() < 0.5 { t.dim } else { t.orange },
                         false,
                     ),
@@ -507,6 +514,15 @@ fn app_layers(app: &App, n: usize) -> Vec<(Vec<f32>, Color, &'static str)> {
     layers
 }
 
+fn swatch(app: &App, name: &str) -> &'static str {
+    let shared = name == "Code" || name == "System";
+    if shared && app.config.memory_chart != MemChart::Full {
+        "□ "
+    } else {
+        "■ "
+    }
+}
+
 fn categories(app: &App) -> Vec<(&'static str, u64, u64, Color)> {
     let t = app.t();
     let s = &app.session;
@@ -531,6 +547,8 @@ fn stacked_chart(
     area: Rect,
     layers: &[(Vec<f32>, Color, &'static str)],
     win: &Win,
+    floor: f32,
+    unit: &str,
 ) {
     let t = pen.t;
     let n = layers.first().map_or(0, |l| l.0.len());
@@ -543,7 +561,7 @@ fn stacked_chart(
                 .sum::<f32>()
         })
         .fold(0.0, f32::max);
-    let max = nice_max(peak.max(10.0));
+    let max = nice_max(peak.max(floor));
     let label_w = 5;
     if area.width <= label_w + 2 || area.height < 3 {
         return;
@@ -562,7 +580,11 @@ fn stacked_chart(
         (max / 2.0, (plot.height - 1) / 2),
         (0.0, plot.height - 1),
     ] {
-        let label = format!("{v:.0}");
+        let label = if max < 10.0 && v.fract().abs() > 1e-3 {
+            format!("{v:.1}{unit}")
+        } else {
+            format!("{v:.0}{unit}")
+        };
         pen.text(
             plot.x.saturating_sub(1 + width(&label)),
             plot.y + r,
@@ -581,14 +603,16 @@ fn stacked_chart(
         }
         let col =
             plot.x + ((*idx as f32 / (n - 1) as f32) * (plot.width - 1) as f32).round() as u16;
-        pen.text(
-            col,
-            plot.y,
-            &format!("▾{label}"),
-            t.yellow,
-            true,
-            plot.right(),
-        );
+        let (start, text) = if col + width(label) + 1 > plot.right() {
+            (col.saturating_sub(width(label)), format!("{label}▾"))
+        } else {
+            (col, format!("▾{label}"))
+        };
+        let end = (start + width(&text)).min(plot.right());
+        for x in start..end {
+            pen.bg(x, plot.y, t.bg);
+        }
+        pen.text(start, plot.y, &text, t.yellow, true, plot.right());
     }
     let y = plot.bottom();
     pen.text(plot.x, y, &win.xl[0], t.dim, false, plot.right());
@@ -603,45 +627,122 @@ fn stacked_chart(
     let _ = app;
 }
 
+fn device_ram_body(pen: &mut Pen, app: &App, inner: Rect, win: &Win) {
+    let bar_h = 4.min(inner.height);
+    ram_bar(pen, app, Rect::new(inner.x, inner.y, inner.width, bar_h));
+    if inner.height > bar_h + 3 {
+        let rest = Rect::new(inner.x, inner.y + bar_h, inner.width, inner.height - bar_h);
+        let (chart, stats) = side(rest, 30, 30, 44);
+        device_ram_chart(pen, app, chart, win);
+        device_ram_stats(pen, app, stats);
+    }
+}
+
+fn process_memory_table(pen: &mut Pen, app: &App, area: Rect) {
+    let t = pen.t;
+    if area.height < 2 {
+        return;
+    }
+    let s = &app.session;
+    let Some(fast) = s.fast.as_ref() else {
+        return;
+    };
+    let page_kb = s
+        .caps
+        .as_ref()
+        .map(|c| c.page_size as u64 / 1024)
+        .filter(|kb| *kb > 0)
+        .unwrap_or(4);
+    let total_kb = fast.mem.map_or(0, |m| m.total_kb).max(1);
+    let filter = app.table_filter.to_lowercase();
+    let mut rows: Vec<(&TaskSample, &str)> = fast
+        .tasks
+        .iter()
+        .filter(|p| p.rss_pages > 0)
+        .map(|p| (p, s.task_display_name(p)))
+        .filter(|(p, name)| {
+            filter.is_empty()
+                || name.to_lowercase().contains(&filter)
+                || p.id.to_string().contains(&filter)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.rss_pages.cmp(&a.0.rss_pages));
+    let top_kb = rows.first().map_or(1, |r| r.0.rss_pages * page_kb).max(1);
+    let visible = (area.height - 1) as usize;
+    let offset = app.scroll[app.page].min(rows.len().saturating_sub(visible));
+    let w = area.width as usize;
+    let fixed = 1 + 7 + 1 + 9 + 7 + 2 + 7 + 2;
+    let name_w = rows
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .map(|r| width(r.1) as usize)
+        .max()
+        .unwrap_or(0)
+        .clamp(15, 48)
+        .min(w.saturating_sub(fixed + 10).max(12));
+    let bar_w = w.saturating_sub(fixed + name_w).max(4) as u16;
+    let header = format!(
+        "{} {} {} {}  {}  {}",
+        pad("PID", 6),
+        pad("NAME", name_w),
+        rpad("RSS", 9),
+        rpad("% RAM", 6),
+        pad("", bar_w as usize),
+        rpad("CPU%", 5),
+    );
+    pen.text(area.x + 1, area.y, &header, t.dim, false, area.right());
+    for (i, (p, name)) in rows.iter().skip(offset).take(visible).enumerate() {
+        let y = area.y + 1 + i as u16;
+        let kb = p.rss_pages * page_kb;
+        let share = kb as f32 * 100.0 / total_kb as f32;
+        let mb = kb as f32 / 1024.0;
+        let size = if mb >= 1024.0 {
+            format!("{:.2} GB", mb / 1024.0)
+        } else {
+            format!("{mb:.0} MB")
+        };
+        let color = if share >= 5.0 {
+            t.orange
+        } else if share >= 1.0 {
+            t.yellow
+        } else {
+            t.fg
+        };
+        let mut x = area.x + 1;
+        x = pen.text(x, y, &pad(&p.id.to_string(), 7), t.dim, false, area.right());
+        x = pen.text(x, y, &pad(name, name_w), t.fg, false, area.right()) + 1;
+        x = pen.text(x, y, &rpad(&size, 9), color, true, area.right()) + 1;
+        x = pen.text(
+            x,
+            y,
+            &rpad(&format!("{share:.1}%"), 6),
+            t.dim,
+            false,
+            area.right(),
+        ) + 2;
+        pen.hbar(x, y, bar_w, kb as f32, top_kb as f32, color);
+        x += bar_w + 2;
+        pen.text(
+            x,
+            y,
+            &rpad(&format!("{:.1}", p.cpu), 5),
+            if p.cpu > 5.0 { t.orange } else { t.dim },
+            false,
+            area.right(),
+        );
+    }
+}
+
 fn device_ram_chart(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
     let t = pen.t;
     let h = &app.session.history;
-    let avail = tail(&h.mem_avail_gb, win.n);
-    let swap = tail(&h.swap_used_gb, win.n);
-    let total = app
-        .session
-        .fast
-        .as_ref()
-        .and_then(|f| f.mem)
-        .map_or(8.0, |m| m.total_kb as f32 / 1048576.0);
-    let ymax = nice_max(total);
-    let marks = win.marks();
-    let ticks = [ymax, ymax / 2.0, 0.0];
-    pen.chart(
-        area,
-        &[
-            ChartLine {
-                data: &avail,
-                color: t.green,
-                fill: true,
-            },
-            ChartLine {
-                data: &swap,
-                color: t.purple,
-                fill: false,
-            },
-        ],
-        &ChartOpts {
-            ymin: 0.0,
-            ymax,
-            ticks: &ticks,
-            fmt: &|v| format!("{v:.0}G"),
-            label_w: 5,
-            xlabels: win.xl(),
-            markers: &marks,
-            hlines: &[],
-        },
-    );
+    let layers = [
+        (tail(&h.mem_used_gb, win.n), t.orange, "used"),
+        (tail(&h.mem_cached_gb, win.n), t.blue, "cached"),
+        (tail(&h.mem_free_gb, win.n), t.green, "free"),
+    ];
+    stacked_chart(pen, app, area, &layers, win, 1.0, "G");
 }
 
 fn device_ram_stats(pen: &mut Pen, app: &App, stats: Rect) {
@@ -767,7 +868,7 @@ fn frame_bars(pen: &mut Pen, app: &App, area: Rect, label_w: u16) {
         .unwrap_or(budget);
     let max = nice_max(p98.max(budget * 3.0)).min(100.0);
     let row_of = |v: f32| -> u16 {
-        (((1.0 - v / max) * plot.height as f32).round() as u16).min(plot.height - 1)
+        (((1.0 - v / max) * plot.height as f32).floor().max(0.0) as u16).min(plot.height - 1)
     };
     for r in 0..plot.height {
         pen.put(plot.x - 1, plot.y + r, "│", t.dim2);
@@ -829,6 +930,36 @@ fn frame_bars(pen: &mut Pen, app: &App, area: Rect, label_w: u16) {
 
 fn mix(a: Color, b: Color, t: f32) -> Color {
     crate::theme::mix(a, b, t)
+}
+
+fn signed1(d: f32) -> String {
+    if d.abs() < 0.05 {
+        "·".to_string()
+    } else {
+        format!("{d:+.1}")
+    }
+}
+
+fn frame_buckets(budget: f32) -> Vec<(f32, f32, String)> {
+    let mut cuts: Vec<f32> = Vec::with_capacity(4);
+    for c in [budget, budget * 2.0, (budget * 3.0).max(50.0), 100.0] {
+        if c <= 100.0 && cuts.last().map_or(true, |l| c > *l + 0.5) {
+            cuts.push(c);
+        }
+    }
+    let mut edges = Vec::with_capacity(cuts.len() + 1);
+    let mut lo = 0.0;
+    for (i, &hi) in cuts.iter().enumerate() {
+        let label = if i == 0 {
+            format!("≤ {hi:.1} ms")
+        } else {
+            format!("{lo:.0}–{hi:.0}")
+        };
+        edges.push((lo, hi, label));
+        lo = hi;
+    }
+    edges.push((lo, f32::INFINITY, format!("> {lo:.0}")));
+    edges
 }
 
 fn frames_gate(app: &App) -> Option<String> {
@@ -960,22 +1091,28 @@ fn tile_frames(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
         let fps = tail(&h.fps, win.n);
         let by = stats.bottom() - 1;
         pen.text(x, by - 1, "fps", t.dim, false, right);
+        let fps_max = hz.unwrap_or(60.0).max(1.0);
         pen.spark(
             x + 5,
             by - 1,
             stats.width.saturating_sub(5),
             &fps,
-            120.0,
+            fps_max,
             &|_| t.green,
         );
         let jank = tail(&h.jank_pct, win.n);
+        let jank_max = jank
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(25.0, f32::max);
         pen.text(x, by, "jank", t.dim, false, right);
         pen.spark(
             x + 5,
             by,
             stats.width.saturating_sub(5),
             &jank,
-            25.0,
+            jank_max,
             &|_| t.red,
         );
     }
@@ -983,7 +1120,8 @@ fn tile_frames(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
 
 fn net_data(app: &App, n: usize) -> (Vec<f32>, Vec<f32>, &'static str) {
     let h = &app.session.history;
-    if app.session.capture.snapshot.is_some() || h.cap_rx.last().is_some() {
+    let newest_capture = h.cap_rx.len() > 0 && h.cap_rx.get(h.cap_rx.len() - 1).is_finite();
+    if app.session.capture.snapshot.is_some() || newest_capture {
         (
             tail(&h.cap_rx, n),
             tail(&h.cap_tx, n),
@@ -1015,12 +1153,8 @@ fn net_chart(pen: &mut Pen, app: &App, area: Rect, win: &Win, label_w: u16) {
     let rxs: Vec<f32> = rx.iter().map(|v| fwd(*v)).collect();
     let txs: Vec<f32> = tx.iter().map(|v| -fwd(*v)).collect();
     let marks = win.marks();
-    let mid = if sqrt { 100.0 } else { sm / 2.0 };
-    let ticks: Vec<f32> = if !sqrt || sm > mid * 1.5 {
-        vec![sm, mid, 0.0, -mid, -sm]
-    } else {
-        vec![sm, 0.0, -sm]
-    };
+    let mid = sm / 2.0;
+    let ticks: Vec<f32> = vec![0.0, sm, -sm, mid, -mid];
     pen.chart(
         area,
         &[
@@ -1079,7 +1213,7 @@ fn tile_network(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
         return;
     }
     let (chart, stats) = side(inner, 36, 26, 40);
-    net_chart(pen, app, chart, win, 6);
+    net_chart(pen, app, chart, win, 7);
     let (rx, tx, _) = net_data(app, 1);
     let (x, mut y, right) = (stats.x, stats.y, stats.right());
     let cap = s.capture.snapshot.is_some();
@@ -1200,20 +1334,43 @@ fn task_time(ticks: u64) -> String {
 }
 
 fn pool_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut in_digits = false;
-    for c in name.chars() {
-        if c.is_ascii_digit() {
-            if !in_digits {
-                out.push('*');
-            }
-            in_digits = true;
-        } else {
-            out.push(c);
-            in_digits = false;
+    if let Some((prefix, _)) = name.split_once(':') {
+        if prefix.to_ascii_lowercase().ends_with("binder") {
+            return prefix.to_string();
         }
     }
+    let mut out = String::with_capacity(name.len());
+    let mut prev: Option<char> = None;
+    let mut run: Option<bool> = None;
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            let keep = *run.get_or_insert(prev.is_some_and(|p| p.is_ascii_alphabetic()));
+            if keep {
+                out.push(c);
+            } else if !prev.is_some_and(|p| p.is_ascii_digit()) {
+                out.push('*');
+            }
+        } else {
+            out.push(c);
+            run = None;
+        }
+        prev = Some(c);
+    }
     out
+}
+
+fn process_group(p: &TaskSample, name: &str) -> &'static str {
+    if p.rss_pages == 0 {
+        "kernel threads"
+    } else if name == "system_server" {
+        "system_server"
+    } else if name.starts_with("android.hardware.") || name.starts_with("vendor.") {
+        "HAL services"
+    } else if name.contains('.') {
+        "apps"
+    } else {
+        "native daemons"
+    }
 }
 
 struct TaskRow<'a> {
@@ -1466,10 +1623,7 @@ fn tile_power(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
     let top = Rect::new(inner.x, inner.y, inner.width, inner.height - temps_h);
     let bottom = Rect::new(inner.x, inner.bottom() - temps_h, inner.width, temps_h);
     let (chart, stats) = side(top, 40, 26, 44);
-    match power_unplugged_note(app) {
-        Some(note) => pen.note(chart, &note, t.dim),
-        None => drain_chart(pen, app, chart, win),
-    }
+    drain_chart(pen, app, chart, win);
     let (x, mut y, right) = (stats.x, stats.y, stats.right());
     if let Some(b) = &s.battery {
         pen.segs(
@@ -1595,22 +1749,55 @@ fn tile_power(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
 
 fn drain_chart(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
     let t = pen.t;
-    let d = tail(&app.session.history.drain_ma, win.n);
+    let note = power_unplugged_note(app);
+    let h = &app.session.history;
+    let d = tail(&h.drain_ma, win.n);
+    let c = tail(&h.charge_ma, win.n);
+    if let Some(note) = &note {
+        if !d.iter().chain(c.iter()).any(|v| v.is_finite()) {
+            pen.note(area, note, t.dim);
+            return;
+        }
+    }
     let peak = d
         .iter()
+        .chain(c.iter())
         .copied()
         .filter(|v| v.is_finite())
         .fold(0.0, f32::max);
     let ymax = nice_max(peak.max(200.0));
     let marks = win.marks();
     let ticks = [ymax, ymax / 2.0, 0.0];
+    if note.is_some() && area.height > 2 {
+        let fake = app.tweaks.unplugged || app.tweaks.doze;
+        let room = area.width.saturating_sub(8) as usize;
+        let label = match (fake, room >= 64) {
+            (true, true) => "reported current · the battery only pretends to be unplugged",
+            (true, false) => "fake unplug, not the app's drain",
+            (false, true) => "charging current, not the app's drain · measure over Wi-Fi adb",
+            (false, false) => "charging, not the app's drain",
+        };
+        pen.text(area.x + 7, area.y, label, t.dim, false, area.right());
+    }
     pen.chart(
-        area,
-        &[ChartLine {
-            data: &d,
-            color: t.yellow,
-            fill: true,
-        }],
+        Rect::new(
+            area.x,
+            area.y + u16::from(note.is_some() && area.height > 2),
+            area.width,
+            area.height - u16::from(note.is_some() && area.height > 2),
+        ),
+        &[
+            ChartLine {
+                data: &d,
+                color: t.yellow,
+                fill: true,
+            },
+            ChartLine {
+                data: &c,
+                color: t.aqua,
+                fill: true,
+            },
+        ],
         &ChartOpts {
             ymin: 0.0,
             ymax,
@@ -1687,7 +1874,39 @@ pub fn cpu(pen: &mut Pen, app: &App, area: Rect) {
         vec![("━ system ", t.blue, false), ("┊ marker", t.yellow, false)]
     };
     let inner = pen.panel(top[0], &[("CPU usage", t.yellow, true)], &legend, None);
-    cpu_chart(pen, app, inner, &win, true);
+    let side_cols = 13.min(inner.width.saturating_sub(20));
+    let chart_rect = Rect::new(inner.x, inner.y, inner.width - side_cols, inner.height);
+    cpu_chart(pen, app, chart_rect, &win, true);
+    {
+        let h = &app.session.history;
+        let f = cpu_factor(app);
+        let x = chart_rect.right() + 1;
+        let right = inner.right();
+        let rows: Vec<(&str, Option<f32>, Color)> = if app.package().is_some() {
+            vec![
+                ("app ", last(&h.app_cpu), t.green),
+                ("kern", last(&h.app_kernel), t.orange),
+                ("sys ", last(&h.sys_cpu), t.blue),
+            ]
+        } else {
+            vec![("sys ", last(&h.sys_cpu), t.blue)]
+        };
+        for (i, (label, v, c)) in rows.iter().enumerate() {
+            let y = inner.y + i as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            pen.segs(
+                x,
+                y,
+                &[
+                    (label, t.dim, false),
+                    (&opt(*v, |v| format!(" {:.1}%", v * f)), *c, true),
+                ],
+                right,
+            );
+        }
+    }
     cpu_now(pen, app, top[1]);
     let inner = pen.panel(
         mid[0],
@@ -1700,10 +1919,26 @@ pub fn cpu(pen: &mut Pen, app: &App, area: Rect) {
         None,
     );
     core_heat(pen, app, inner, &win);
+    let legend: Vec<(String, Color)> = app
+        .session
+        .caps
+        .as_ref()
+        .map(|c| {
+            c.clusters
+                .iter()
+                .map(|k| (format!("━ {} ", k.name), cluster_color(t, k.name)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut legend_segs: Vec<Seg> = legend
+        .iter()
+        .map(|(s, c)| (s.as_str(), *c, false))
+        .collect();
+    legend_segs.push(("GHz", t.dim, false));
     let inner = pen.panel(
         mid[1],
         &[("Cluster frequency", t.yellow, true)],
-        &[("GHz", t.dim, false)],
+        &legend_segs,
         None,
     );
     if let Some(u) = unsupported(app, Source::CpuFreq) {
@@ -1735,15 +1970,19 @@ pub fn cpu(pen: &mut Pen, app: &App, area: Rect) {
     }
     let inner = pen.panel(
         bot[1],
-        &[("Thread pools", t.yellow, true)],
+        &[(
+            if has_app {
+                "Thread pools"
+            } else {
+                "Process groups"
+            },
+            t.yellow,
+            true,
+        )],
         &[("g", t.yellow, false), (" group in table", t.dim, false)],
         None,
     );
-    if has_app {
-        pools_table(pen, app, inner, false);
-    } else {
-        pen.note(inner, "Pick an app with p to group its threads", t.dim);
-    }
+    pools_table(pen, app, inner, false);
 }
 
 fn cpu_now(pen: &mut Pen, app: &App, area: Rect) {
@@ -1822,7 +2061,72 @@ fn cpu_now(pen: &mut Pen, app: &App, area: Rect) {
         ],
         right,
     );
-    y += 2;
+    y += 1;
+    if app.package().is_none() {
+        if let Some(fs) = app.session.fast.as_ref() {
+            pen.segs(
+                x,
+                y,
+                &[
+                    ("  peak ", t.dim, false),
+                    (&opt(h.sys_cpu.max(), p), t.orange, false),
+                    ("  avg ", t.dim, false),
+                    (&opt(h.sys_cpu.avg(), p), t.purple, false),
+                ],
+                right,
+            );
+            y += 2;
+            let running = fs.tasks.iter().filter(|k| k.state == 'R').count();
+            let blocked = fs.tasks.iter().filter(|k| k.state == 'D').count();
+            pen.segs(
+                x,
+                y,
+                &[
+                    ("PROCESSES ", t.dim, false),
+                    (&fs.tasks.len().to_string(), t.fg, false),
+                    ("  running ", t.dim, false),
+                    (&running.to_string(), t.green, false),
+                    ("  blocked ", t.dim, false),
+                    (
+                        &blocked.to_string(),
+                        if blocked > 0 { t.red } else { t.fg },
+                        false,
+                    ),
+                ],
+                right,
+            );
+            y += 2;
+            let mut top: Vec<&TaskSample> = fs.tasks.iter().collect();
+            top.sort_by(|a, b| {
+                b.cpu
+                    .partial_cmp(&a.cpu)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            pen.text(x, y, "BUSIEST  % of one core", t.dim, false, right);
+            y += 1;
+            for task in top.iter().take(6) {
+                if y >= inner.bottom() {
+                    break;
+                }
+                pen.segs(
+                    x,
+                    y,
+                    &[
+                        (
+                            &rpad(&format!("{:.1}", task.cpu), 6),
+                            if task.cpu > 20.0 { t.red } else { t.orange },
+                            false,
+                        ),
+                        ("  ", t.dim, false),
+                        (app.session.task_display_name(task), t.fg, false),
+                    ],
+                    right,
+                );
+                y += 1;
+            }
+        }
+    }
+    y += 1;
     if let Some(a) = app.session.fast.as_ref().and_then(|f| f.app.as_ref()) {
         let rowsv: Vec<Vec<(String, Color, bool)>> = vec![
             vec![
@@ -1919,27 +2223,57 @@ fn core_heat(pen: &mut Pen, app: &App, area: Rect, win: &Win) {
     let heat_x = area.x + 5;
     let heat_w = area.width.saturating_sub(5 + 13);
     let fast = app.session.fast.as_ref();
-    for (i, series) in h.cores.iter().enumerate().take(rows_avail) {
-        let y = area.y + i as u16;
+    let n_cores = h.cores.len();
+    let group = n_cores.div_ceil(rows_avail.max(1)).max(1);
+    for (row, start) in (0..n_cores).step_by(group).enumerate() {
+        let end = (start + group).min(n_cores);
+        let y = area.y + row as u16;
         let cl = caps
-            .and_then(|c| c.cluster_of(i as u16))
+            .and_then(|c| c.cluster_of(start as u16))
             .and_then(|ci| caps.map(|c| c.clusters[ci].name));
         let color = cl.map_or(t.fg, |n| cluster_color(t, n));
+        let label = if end - start == 1 {
+            format!("{start:>2}")
+        } else {
+            format!("{start}-{}", end - 1)
+        };
         pen.segs(
             area.x + 1,
             y,
             &[
                 (cl.map_or("C", cluster_letter), color, true),
-                (&format!("{i:>2}"), t.dim, false),
+                (&label, t.dim, false),
             ],
             heat_x,
         );
-        pen.heat_row(heat_x, y, heat_w, &tail(series, win.n));
-        let core = fast.and_then(|f| f.cores.iter().find(|c| c.id as usize == i));
-        let v = core.map_or(f32::NAN, |c| c.usage);
-        let ghz = core
-            .filter(|c| c.cur_khz > 0)
-            .map(|c| format!("{:.2}G", c.cur_khz as f32 / 1e6))
+        let mut data = tail(&h.cores[start], win.n);
+        for series in &h.cores[start + 1..end] {
+            for (d, v) in data.iter_mut().zip(tail(series, win.n)) {
+                if v.is_finite() && (!d.is_finite() || v > *d) {
+                    *d = v;
+                }
+            }
+        }
+        pen.heat_row(heat_x, y, heat_w, &data);
+        let cores: Vec<_> = fast
+            .map(|f| {
+                f.cores
+                    .iter()
+                    .filter(|c| (start..end).contains(&(c.id as usize)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let v =
+            cores
+                .iter()
+                .map(|c| c.usage)
+                .fold(f32::NAN, |a, b| if a.is_finite() { a.max(b) } else { b });
+        let ghz = cores
+            .iter()
+            .map(|c| c.cur_khz)
+            .max()
+            .filter(|k| *k > 0)
+            .map(|k| format!("{:.2}G", k as f32 / 1e6))
             .unwrap_or_default();
         pen.segs(
             heat_x + heat_w + 1,
@@ -2048,9 +2382,12 @@ fn pools_table(pen: &mut Pen, app: &App, area: Rect, in_main: bool) {
         return;
     }
     let mut pools: HashMap<String, (u32, f32, f32)> = HashMap::new();
+    let device = app.package().is_none();
     for r in task_rows(app) {
         let key = if r.main {
             "main".to_string()
+        } else if device {
+            process_group(r.task, r.name).to_string()
         } else {
             pool_name(r.name)
         };
@@ -2182,7 +2519,7 @@ pub fn memory(pen: &mut Pen, app: &App, area: Rect) {
             Some(g) => pen.note(inner, g, t.dim),
             None => {
                 let layers = app_layers(app, win.n);
-                stacked_chart(pen, app, inner, &layers, &win);
+                stacked_chart(pen, app, inner, &layers, &win, 10.0, "");
             }
         }
         memory_now(pen, app, top[1]);
@@ -2252,15 +2589,10 @@ pub fn memory(pen: &mut Pen, app: &App, area: Rect) {
         let inner = pen.panel(
             r[0],
             &[("Device RAM", t.yellow, true)],
-            &[
-                ("━ available ", t.green, false),
-                ("━ swap used", t.purple, false),
-            ],
+            &[("GB over time", t.dim, false)],
             None,
         );
-        let (chart, stats) = side(inner, 30, 30, 44);
-        device_ram_chart(pen, app, chart, &win);
-        device_ram_stats(pen, app, stats);
+        device_ram_body(pen, app, inner, &win);
     }
     let inner = pen.panel(
         r[2],
@@ -2268,25 +2600,22 @@ pub fn memory(pen: &mut Pen, app: &App, area: Rect) {
             if app_mode {
                 "Device RAM"
             } else {
-                "Top processes"
+                "Processes by memory"
             },
             t.yellow,
             true,
         )],
-        &[],
+        &[(
+            if app_mode { "" } else { "RSS · resident set" },
+            t.dim,
+            false,
+        )],
         None,
     );
     if app_mode {
-        let bar_h = 4.min(inner.height);
-        ram_bar(pen, app, Rect::new(inner.x, inner.y, inner.width, bar_h));
-        if inner.height > bar_h + 3 {
-            let rest = Rect::new(inner.x, inner.y + bar_h, inner.width, inner.height - bar_h);
-            let (chart, stats) = side(rest, 30, 30, 44);
-            device_ram_chart(pen, app, chart, &win);
-            device_ram_stats(pen, app, stats);
-        }
+        device_ram_body(pen, app, inner, &win);
     } else {
-        task_table(pen, app, inner, false);
+        process_memory_table(pen, app, inner);
     }
 }
 
@@ -2338,7 +2667,7 @@ fn memory_now(pen: &mut Pen, app: &App, area: Rect) {
             x,
             y,
             &[
-                ("■ ", color, false),
+                (swatch(app, name), color, false),
                 (&pad(name, 12), t.fg, false),
                 (&rpad(&format!("{:.1}", kb as f32 / 1024.0), 6), t.fg, false),
                 (
@@ -2354,7 +2683,7 @@ fn memory_now(pen: &mut Pen, app: &App, area: Rect) {
                     false,
                 ),
                 (
-                    &rpad(&format!("{d:+.1}"), 7),
+                    &rpad(&signed1(d), 7),
                     if d.abs() < 0.5 { t.dim } else { t.orange },
                     false,
                 ),
@@ -2362,20 +2691,40 @@ fn memory_now(pen: &mut Pen, app: &App, area: Rect) {
             ],
             right,
         );
-        let data = tail(series[i], 120);
+        let data: Vec<f32> = tail(series[i], 120)
+            .into_iter()
+            .skip_while(|v| !v.is_finite())
+            .collect();
         let min = data
             .iter()
             .copied()
             .filter(|v| v.is_finite())
             .fold(f32::INFINITY, f32::min);
         let rel: Vec<f32> = data.iter().map(|v| v - min).collect();
-        pen.spark(end, y, right.saturating_sub(end + 1), &rel, 0.0, &|_| {
-            if color == t.dim2 {
-                t.gray
-            } else {
-                color
-            }
-        });
+        let range = rel
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(0.0, f32::max);
+        let floor = if min.is_finite() {
+            (min * 0.05).max(1.0)
+        } else {
+            1.0
+        };
+        pen.spark(
+            end,
+            y,
+            right.saturating_sub(end + 1),
+            &rel,
+            range.max(floor),
+            &|_| {
+                if color == t.dim2 {
+                    t.gray
+                } else {
+                    color
+                }
+            },
+        );
         y += 1;
     }
     if y + 1 < inner.bottom() {
@@ -2532,7 +2881,11 @@ fn objects_panel(pen: &mut Pen, app: &App, area: Rect) {
                 ),
                 (if warn { " ⚠" } else { "" }, t.orange, false),
             ],
-            x + inner.width / 2,
+            if two {
+                x + inner.width / 2
+            } else {
+                inner.right()
+            },
         );
     }
     let note_y = inner.y + per_col as u16 + 1;
@@ -2770,7 +3123,7 @@ pub fn frames(pen: &mut Pen, app: &App, area: Rect) {
                 ticks: &ticks,
                 fmt: &|v| format!("{v:.0}"),
                 label_w: 5,
-                xlabels: None,
+                xlabels: win.xl(),
                 markers: &marks,
                 hlines: &[],
             },
@@ -2781,9 +3134,27 @@ pub fn frames(pen: &mut Pen, app: &App, area: Rect) {
             inner.width - 5,
             jank_h,
         );
-        pen.text(inner.x, jr.y, "jank", t.dim, false, jr.x);
         let cols_data = resample(&jank, jr.width as usize);
-        pen.vbars(jr, &cols_data, 25.0, &|_| t.red, None);
+        let jank_max = nice_max(
+            cols_data
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(25.0, f32::max),
+        )
+        .min(100.0);
+        pen.text(inner.x, jr.y, "jank", t.dim, false, jr.x);
+        if jr.height >= 2 {
+            pen.text(
+                inner.x,
+                jr.y + 1,
+                &format!("{jank_max:.0}%"),
+                t.dim,
+                false,
+                jr.x,
+            );
+        }
+        pen.vbars(jr, &cols_data, jank_max, &|_| t.red, Some(t.red));
     }
     let since = s.frames_since_start();
     let inner = pen.panel(
@@ -2922,14 +3293,7 @@ pub fn frames(pen: &mut Pen, app: &App, area: Rect) {
     );
     if let Some(f) = &since {
         let b = budget.unwrap_or(16.67);
-        let e3 = (b * 3.0).max(50.0);
-        let edges = [
-            (0.0, b, format!("≤ {b:.1} ms")),
-            (b, b * 2.0, format!("{:.0}–{:.0}", b, b * 2.0)),
-            (b * 2.0, e3, format!("{:.0}–{:.0}", b * 2.0, e3)),
-            (e3, 100.0, format!("{e3:.0}–100")),
-            (100.0, f32::INFINITY, "> 100".into()),
-        ];
+        let edges = frame_buckets(b);
         let counts: Vec<u64> = edges
             .iter()
             .map(|(lo, hi, _)| {
@@ -3227,7 +3591,7 @@ pub fn network(pen: &mut Pen, app: &App, area: Rect) {
             false,
             inner.right(),
         );
-        let max = hosts.first().map_or(1, |h| h.rx + h.tx).max(1) as f32;
+        let max = hosts.iter().map(|h| h.rx + h.tx).sum::<u64>().max(1) as f32;
         for (i, hst) in hosts.iter().enumerate() {
             let y = inner.y + 1 + i as u16;
             if y >= inner.bottom() {
@@ -3460,22 +3824,23 @@ pub fn power(pen: &mut Pen, app: &App, area: Rect) {
     let mid = cols(r[1], &[Constraint::Min(40), Constraint::Length(side_w)]);
     let h = &s.history;
     let drain_info = match (h.drain_ma.avg(), h.drain_ma.max()) {
-        (Some(a), Some(m)) => format!("mA · avg {a:.0} · peak {m:.0}"),
+        (Some(a), Some(m)) => format!("mA · drain avg {a:.0} · peak {m:.0}"),
         _ => "mA".into(),
     };
     let inner = pen.panel(
         top[0],
-        &[("Battery drain", t.yellow, true)],
-        &[(&drain_info, t.dim, false)],
+        &[("Battery current", t.yellow, true)],
+        &[
+            ("━ drain ", t.yellow, false),
+            ("━ charging  ", t.aqua, false),
+            (&drain_info, t.dim, false),
+        ],
         None,
     );
     if let Some(u) = unsupported(app, Source::Battery) {
         pen.note(inner, &u, t.dim);
     } else {
-        match power_unplugged_note(app) {
-            Some(note) => pen.note(inner, &note, t.dim),
-            None => drain_chart(pen, app, inner, &win),
-        }
+        drain_chart(pen, app, inner, &win);
     }
     let inner = pen.panel(top[1], &[("Battery", t.yellow, true)], &[], None);
     if let Some(b) = &s.battery {
@@ -3740,14 +4105,26 @@ pub fn power(pen: &mut Pen, app: &App, area: Rect) {
                 x,
                 y,
                 &[
-                    (&pad(&sensor.name, 7), temp_color_at(t, i), true),
+                    (
+                        &pad(&sensor.name, 7),
+                        temp_color_at(
+                            t,
+                            app.session
+                                .history
+                                .temps
+                                .iter()
+                                .position(|(n, _)| *n == sensor.name)
+                                .unwrap_or(i),
+                        ),
+                        true,
+                    ),
                     (
                         &rpad(&format!("{:.1}°", tu.convert(sensor.celsius)), 6),
                         c,
                         false,
                     ),
                     (
-                        &rpad(&format!("{d:+.1}"), 6),
+                        &rpad(&signed1(d), 6),
                         if d.abs() > 1.0 { t.orange } else { t.dim },
                         false,
                     ),
@@ -3997,4 +4374,44 @@ fn temp_color_at(t: &Theme, i: usize) -> Color {
     [
         t.red, t.orange, t.yellow, t.aqua, t.blue, t.green, t.purple, t.fg,
     ][i % 8]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{frame_buckets, pool_name, signed1};
+
+    #[test]
+    fn thread_pool_names() {
+        assert_eq!(pool_name("binder:2728_2"), "binder");
+        assert_eq!(pool_name("binder:2728_D"), "binder");
+        assert_eq!(pool_name("HwBinder:2728_1"), "HwBinder");
+        assert_eq!(pool_name("Lite Thread #7"), "Lite Thread #*");
+        assert_eq!(pool_name("pool-3-thread-12"), "pool-*-thread-*");
+        assert_eq!(pool_name("V8 DefaultWorke"), "V8 DefaultWorke");
+        assert_eq!(pool_name("anrV34-1"), "anrV34-*");
+        assert_eq!(pool_name("RenderThread"), "RenderThread");
+        assert_eq!(signed1(-0.01), "·");
+        assert_eq!(signed1(-3.26), "-3.3");
+    }
+
+    #[test]
+    fn frame_buckets_are_never_empty_or_inverted() {
+        for hz in [10.0f32, 24.0, 30.0, 48.0, 60.0, 90.0, 120.0, 144.0] {
+            let edges = frame_buckets(1000.0 / hz);
+            assert!(
+                edges.iter().all(|(lo, hi, _)| hi > lo),
+                "{hz} Hz: {edges:?}"
+            );
+        }
+        let labels: Vec<String> = frame_buckets(1000.0 / 30.0)
+            .into_iter()
+            .map(|e| e.2)
+            .collect();
+        assert_eq!(labels, ["≤ 33.3 ms", "33–67", "67–100", "> 100"]);
+        let labels: Vec<String> = frame_buckets(1000.0 / 120.0)
+            .into_iter()
+            .map(|e| e.2)
+            .collect();
+        assert_eq!(labels, ["≤ 8.3 ms", "8–17", "17–50", "50–100", "> 100"]);
+    }
 }

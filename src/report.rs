@@ -7,7 +7,7 @@ use crate::collect::Groups;
 use crate::model::*;
 use crate::session::{Series, Session};
 
-pub const SCHEMA: &str = "android-perf-monitor/report@1";
+pub const SCHEMA: &str = "adbtop/report@1";
 
 fn finite(v: f32) -> Option<f32> {
     v.is_finite().then_some(v)
@@ -612,7 +612,7 @@ pub fn build(s: &Session, mode: &'static str, groups: Groups, after_window_s: f3
 
     let mut report = Report {
         schema: SCHEMA,
-        tool: format!("android-perf-monitor {}", env!("CARGO_PKG_VERSION")),
+        tool: format!("adbtop {}", env!("CARGO_PKG_VERSION")),
         mode,
         device,
         app,

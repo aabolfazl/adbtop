@@ -30,7 +30,7 @@ class CaptureService : VpnService() {
         override fun run() {
             val current = server ?: return
             if (idleStopMillis > 0 && current.idleMillis() >= idleStopMillis) {
-                Log.i(TAG, "No monitor connected for ${idleStopMillis / 1000} s, stopping the capture")
+                Log.i(TAG, "No adbtop connected for ${idleStopMillis / 1000} s, stopping the capture")
                 stopCapture()
                 stopSelf()
                 return
@@ -67,7 +67,7 @@ class CaptureService : VpnService() {
         }
 
         val builder = Builder()
-            .setSession("Android Perf Agent")
+            .setSession("adbtop agent")
             .setMtu(MTU)
             .addAddress(VPN_ADDRESS, 30)
             .addRoute("0.0.0.0", 0)

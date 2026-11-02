@@ -278,7 +278,17 @@ impl<'a> Pen<'a> {
 
     pub fn stacked(&mut self, area: Rect, layers: &[(&[f32], Color)], max: f32) {
         let w = area.width as usize;
-        let cols: Vec<Vec<f32>> = layers.iter().map(|(d, _)| resample_last(d, w)).collect();
+        let data: Vec<&[f32]> = layers.iter().map(|(d, _)| *d).collect();
+        let picks = pick_peaks(&data, w);
+        let cols: Vec<Vec<f32>> = data
+            .iter()
+            .map(|d| {
+                picks
+                    .iter()
+                    .map(|p| p.and_then(|j| d.get(j).copied()).unwrap_or(f32::NAN))
+                    .collect()
+            })
+            .collect();
         let bg = self.t.bg;
         for i in 0..w {
             let mut cum = 0f32;
@@ -310,14 +320,29 @@ impl<'a> Pen<'a> {
                     self.put(x, y, "█", bottom.2);
                     continue;
                 }
+                let overlap =
+                    |s: &(f32, f32, Color), a: f32, b: f32| (s.1.min(b) - s.0.max(a)).max(0.0);
+                let widest = |a: f32, b: f32| {
+                    segs.iter()
+                        .max_by(|p, q| {
+                            overlap(p, a, b)
+                                .partial_cmp(&overlap(q, a, b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|s| s.2)
+                };
+                if cum < hi {
+                    let n = (((cum - lo) / (hi - lo)) * 8.0).round().clamp(1.0, 8.0) as usize;
+                    let fg = widest(lo, cum).unwrap_or(bottom.2);
+                    if let Some(c) = self.cell(x, y) {
+                        c.set_symbol(VBLOCKS[n]).set_fg(fg).set_bg(bg);
+                    }
+                    continue;
+                }
                 let n = (((bottom.1 - lo) / (hi - lo)) * 8.0)
                     .round()
                     .clamp(1.0, 7.0) as usize;
-                let top = segs
-                    .iter()
-                    .find(|s| bottom.1 + 1e-6 >= s.0 && bottom.1 + 1e-6 < s.1)
-                    .map(|s| s.2)
-                    .unwrap_or(bg);
+                let top = widest(bottom.1, hi).unwrap_or(bg);
                 if let Some(c) = self.cell(x, y) {
                     c.set_symbol(VBLOCKS[n]).set_fg(bottom.2).set_bg(top);
                 }
@@ -351,10 +376,15 @@ impl<'a> Pen<'a> {
             for r in 0..plot.height {
                 self.put(plot.x - 1, plot.y + r, "│", t.dim2);
             }
+            let mut used: Vec<u16> = Vec::with_capacity(o.ticks.len());
             for &v in o.ticks {
                 let r = row_of(v);
                 let label = (o.fmt)(v);
                 let lw = width(&label);
+                if used.contains(&r) || lw + 1 > label_w {
+                    continue;
+                }
+                used.push(r);
                 self.text(
                     plot.x.saturating_sub(1 + lw),
                     plot.y + r,
@@ -418,8 +448,12 @@ impl<'a> Pen<'a> {
         }
         if let Some([l, m, r]) = o.xlabels {
             let y = plot.bottom();
-            self.text(plot.x, y, l, t.dim, false, plot.right());
-            if !m.is_empty() {
+            let fits_ends = plot.width >= width(l) + width(r) + 2;
+            let fits_mid = plot.width >= width(l) + width(m) + width(r) + 4;
+            if fits_ends {
+                self.text(plot.x, y, l, t.dim, false, plot.right());
+            }
+            if !m.is_empty() && fits_mid {
                 self.text(
                     plot.x + plot.width.saturating_sub(width(m)) / 2,
                     y,
@@ -446,40 +480,60 @@ impl<'a> Pen<'a> {
         let (pw, ph) = (cw * 2, ch * 4);
         let mut bits = vec![0u8; cw * ch];
         let mut colors = vec![Color::Reset; cw * ch];
-        for line in lines {
+        let mut by_line = vec![false; cw * ch];
+        let to_py = |v: f32| -> i32 {
+            (((1.0 - (v - ymin) / span) * (ph - 1) as f32).round() as i32).clamp(0, ph as i32 - 1)
+        };
+        let zero = to_py(0f32.max(ymin));
+        let ordered = lines
+            .iter()
+            .filter(|l| l.fill)
+            .chain(lines.iter().filter(|l| !l.fill));
+        for line in ordered {
             if line.data.is_empty() || n < 1 {
                 continue;
             }
             let len = line.data.len();
-            let zero = (((1.0 - (0f32.max(ymin) - ymin) / span) * (ph - 1) as f32).round() as i32)
-                .clamp(0, ph as i32 - 1);
-            let mut prev: Option<i32> = None;
+            let mut prev: Option<(i32, i32)> = None;
             for px in 0..pw {
-                let tpos = if pw > 1 {
-                    px as f32 * (len.max(2) - 1) as f32 / (pw - 1) as f32
+                let range = if len > pw {
+                    let a = px * len / pw;
+                    let b = ((px + 1) * len / pw).max(a + 1).min(len);
+                    min_max(&line.data[a..b])
                 } else {
-                    0.0
+                    let tpos = if pw > 1 {
+                        px as f32 * (len.max(2) - 1) as f32 / (pw - 1) as f32
+                    } else {
+                        0.0
+                    };
+                    let v = sample(line.data, tpos);
+                    v.is_finite().then_some((v, v))
                 };
-                let v = sample(line.data, tpos);
-                if !v.is_finite() {
+                let Some((lo, hi)) = range else {
                     prev = None;
                     continue;
-                }
-                let py = (((1.0 - (v - ymin) / span) * (ph - 1) as f32).round() as i32)
-                    .clamp(0, ph as i32 - 1);
+                };
+                let (top, bottom) = (to_py(hi), to_py(lo));
                 let (a, b) = if line.fill {
-                    (py.min(zero), py.max(zero))
-                } else if let Some(p) = prev {
-                    (p.min(py), p.max(py))
+                    (top.min(zero), bottom.max(zero))
                 } else {
-                    (py, py)
+                    match prev {
+                        Some((pt, _)) if pt > bottom => (top, pt),
+                        Some((_, pb)) if pb < top => (pb, bottom),
+                        _ => (top, bottom),
+                    }
                 };
                 for yy in a..=b {
                     let idx = (yy as usize / 4) * cw + px / 2;
                     bits[idx] |= BITS[px & 1][yy as usize & 3];
-                    colors[idx] = line.color;
+                    if !line.fill || !by_line[idx] {
+                        colors[idx] = line.color;
+                    }
+                    if !line.fill {
+                        by_line[idx] = true;
+                    }
                 }
-                prev = Some(py);
+                prev = Some((top, bottom));
             }
         }
         for (i, &b) in bits.iter().enumerate() {
@@ -496,27 +550,41 @@ impl<'a> Pen<'a> {
     }
 
     fn block_lines(&mut self, plot: Rect, lines: &[ChartLine], ymin: f32, span: f32) {
-        for line in lines {
-            let cols = resample_last(line.data, plot.width as usize);
+        let h = plot.height as i32;
+        let level = |v: f32| (((v - ymin) / span).clamp(0.0, 1.0) * h as f32 * 8.0).round() as i32;
+        let base = 0f32.max(ymin);
+        let z = level(base);
+        let bg = self.t.bg;
+        let ordered = lines
+            .iter()
+            .filter(|l| l.fill)
+            .chain(lines.iter().filter(|l| !l.fill));
+        for line in ordered {
+            let cols = resample_extreme(line.data, plot.width as usize, base);
             for (i, v) in cols.iter().enumerate() {
                 if !v.is_finite() {
                     continue;
                 }
                 let x = plot.x + i as u16;
-                let e =
-                    (((v - ymin) / span).clamp(0.0, 1.0) * plot.height as f32 * 8.0).round() as i32;
+                let e = level(*v);
                 if line.fill {
-                    for r in 0..plot.height {
-                        let rem = e - r as i32 * 8;
-                        if rem <= 0 {
-                            break;
+                    let (lo, hi) = (e.min(z), e.max(z));
+                    for r in 0..h {
+                        let (cell_lo, cell_hi) = (r * 8, r * 8 + 8);
+                        let (a, b) = (lo.max(cell_lo), hi.min(cell_hi));
+                        if b <= a {
+                            continue;
                         }
-                        self.put(
-                            x,
-                            plot.bottom() - 1 - r,
-                            VBLOCKS[rem.min(8) as usize],
-                            line.color,
-                        );
+                        let y = plot.bottom() - 1 - r as u16;
+                        if a > cell_lo && b == cell_hi {
+                            if let Some(c) = self.cell(x, y) {
+                                c.set_symbol(VBLOCKS[(a - cell_lo) as usize])
+                                    .set_fg(bg)
+                                    .set_bg(line.color);
+                            }
+                        } else {
+                            self.put(x, y, VBLOCKS[(b - cell_lo) as usize], line.color);
+                        }
                     }
                 } else {
                     let r = ((e - 1).max(0) / 8) as u16;
@@ -599,24 +667,70 @@ pub fn resample(d: &[f32], w: usize) -> Vec<f32> {
         .collect()
 }
 
-fn resample_last(d: &[f32], w: usize) -> Vec<f32> {
-    let n = d.len();
-    if w == 0 {
-        return Vec::new();
+fn min_max(d: &[f32]) -> Option<(f32, f32)> {
+    d.iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(None, |acc, v| match acc {
+            None => Some((v, v)),
+            Some((lo, hi)) => Some((lo.min(v), hi.max(v))),
+        })
+}
+
+fn bucket(i: usize, n: usize, w: usize) -> std::ops::Range<usize> {
+    if n < w {
+        let j = i * n / w;
+        j..j + 1
+    } else {
+        let a = i * n / w;
+        a..((i + 1) * n / w).max(a + 1).min(n)
     }
+}
+
+pub fn resample_extreme(d: &[f32], w: usize, base: f32) -> Vec<f32> {
+    let n = d.len();
     (0..w)
         .map(|i| {
             if n == 0 {
                 return f32::NAN;
             }
-            let a = i * n / w;
-            let b = ((i + 1) * n / w).max(a + 1).min(n);
-            d[a..b]
+            d[bucket(i, n, w)]
                 .iter()
-                .rev()
                 .copied()
-                .find(|v| v.is_finite())
-                .unwrap_or(f32::NAN)
+                .filter(|v| v.is_finite())
+                .fold(f32::NAN, |acc, v| {
+                    if !acc.is_finite() || (v - base).abs() > (acc - base).abs() {
+                        v
+                    } else {
+                        acc
+                    }
+                })
+        })
+        .collect()
+}
+
+pub fn pick_peaks(layers: &[&[f32]], w: usize) -> Vec<Option<usize>> {
+    let n = layers.iter().map(|d| d.len()).max().unwrap_or(0);
+    let value = |j: usize| -> Option<f32> {
+        let mut any = false;
+        let mut sum = 0.0;
+        for d in layers {
+            if let Some(v) = d.get(j).copied().filter(|v| v.is_finite()) {
+                any = true;
+                sum += v;
+            }
+        }
+        any.then_some(sum)
+    };
+    (0..w)
+        .map(|i| {
+            if n == 0 {
+                return None;
+            }
+            bucket(i, n, w)
+                .filter_map(|j| value(j).map(|v| (j, v)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(j, _)| j)
         })
         .collect()
 }
@@ -780,5 +894,154 @@ mod tests {
                 .is_some_and(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
         });
         assert!(has_braille);
+    }
+
+    fn opts<'a>(ymin: f32, ymax: f32, ticks: &'a [f32]) -> ChartOpts<'a> {
+        ChartOpts {
+            ymin,
+            ymax,
+            ticks,
+            fmt: &|v| format!("{v:.0}"),
+            label_w: 0,
+            xlabels: None,
+            markers: &[],
+            hlines: &[],
+        }
+    }
+
+    fn row_has_ink(buf: &Buffer, y: u16) -> bool {
+        (0..buf.area.width).any(|x| {
+            let s = buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ");
+            s != " " && s != "\u{2800}"
+        })
+    }
+
+    #[test]
+    fn braille_keeps_a_one_sample_spike() {
+        let theme = crate::theme::all(&Default::default()).remove(0);
+        let mut data = vec![5.0; 120];
+        data[61] = 100.0;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+        let mut pen = Pen {
+            buf: &mut buf,
+            t: &theme,
+            braille: true,
+        };
+        pen.chart(
+            Rect::new(0, 0, 10, 5),
+            &[ChartLine {
+                data: &data,
+                color: theme.green,
+                fill: false,
+            }],
+            &opts(0.0, 100.0, &[]),
+        );
+        assert!(
+            row_has_ink(&buf, 0),
+            "the spike to 100 must reach the top row"
+        );
+    }
+
+    #[test]
+    fn blocks_mirrored_fill_grows_from_zero() {
+        let theme = crate::theme::all(&Default::default()).remove(0);
+        let rx = vec![0.5; 8];
+        let tx = vec![0.0; 8];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 4));
+        let mut pen = Pen {
+            buf: &mut buf,
+            t: &theme,
+            braille: false,
+        };
+        pen.chart(
+            Rect::new(0, 0, 8, 4),
+            &[
+                ChartLine {
+                    data: &rx,
+                    color: theme.aqua,
+                    fill: true,
+                },
+                ChartLine {
+                    data: &tx,
+                    color: theme.purple,
+                    fill: true,
+                },
+            ],
+            &opts(-1.0, 1.0, &[]),
+        );
+        assert!(!row_has_ink(&buf, 0), "0.5 of 1 must not reach the top row");
+        assert!(row_has_ink(&buf, 1), "0.5 fills the row above zero");
+        assert!(!row_has_ink(&buf, 2), "nothing sent, nothing below zero");
+        assert!(!row_has_ink(&buf, 3), "nothing sent, nothing below zero");
+    }
+
+    #[test]
+    fn tick_labels_never_share_a_row() {
+        let theme = crate::theme::all(&Default::default()).remove(0);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 5));
+        let mut pen = Pen {
+            buf: &mut buf,
+            t: &theme,
+            braille: true,
+        };
+        let ticks = [0.0, 100.0, -100.0, 1.0, -1.0];
+        pen.chart(
+            Rect::new(0, 0, 20, 5),
+            &[],
+            &ChartOpts {
+                label_w: 5,
+                ..opts(-100.0, 100.0, &ticks)
+            },
+        );
+        let row = |y: u16| -> String {
+            (0..4)
+                .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(row(2), "0");
+        assert_eq!(row(0), "100");
+        assert_eq!(row(4), "-100");
+    }
+
+    #[test]
+    fn stacked_and_blocks_keep_the_peak_sample() {
+        let flat = vec![1.0; 100];
+        let mut spiky = vec![1.0; 100];
+        spiky[37] = 9.0;
+        let picks = pick_peaks(&[&flat, &spiky], 10);
+        assert_eq!(picks[3], Some(37));
+        assert_eq!(
+            resample_extreme(&[-1.0, -5.0, 2.0, 0.5], 1, 0.0),
+            vec![-5.0]
+        );
+        assert_eq!(
+            resample_extreme(&[3.0, 7.0, 2.0, 1.0], 2, 0.0),
+            vec![7.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn stacked_top_is_never_higher_than_the_total() {
+        let theme = crate::theme::all(&Default::default()).remove(0);
+        let a = [5.0];
+        let b = [0.5];
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 4));
+        let mut pen = Pen {
+            buf: &mut buf,
+            t: &theme,
+            braille: true,
+        };
+        pen.stacked(
+            Rect::new(0, 0, 1, 4),
+            &[(&a, theme.green), (&b, theme.orange)],
+            16.0,
+        );
+        let cell = |y: u16| buf.cell((0, y)).unwrap().clone();
+        assert_eq!(cell(3).symbol(), "█");
+        assert_eq!(cell(2).symbol(), "▃");
+        assert_eq!(cell(2).bg, theme.bg);
+        assert_eq!(cell(1).symbol(), " ");
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use prost::Message;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -14,16 +15,151 @@ pub mod proto {
 }
 
 const CONTROL_ACTIVITY: &str = "io.github.aabolfazl.perfagent/.ControlActivity";
-const STATS_SOCKET: &str = "android-perf-agent";
-const PCAP_SOCKET: &str = "android-perf-agent-pcap";
+const STATS_SOCKET: &str = "adbtop-agent";
+const PCAP_SOCKET: &str = "adbtop-agent-pcap";
 const PCAP_HEADER_LEN: usize = 24;
 const PCAP_RECORD_HEADER_LEN: usize = 16;
 const MAX_PCAP_RECORD_LEN: usize = 256 * 1024;
 const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 
-pub const NOT_INSTALLED: &str = "capture agent is not installed (see android-agent/README.md)";
+pub const NOT_INSTALLED: &str = "capture agent is not installed; run `adbtop agent install`";
 
 pub const IDLE_STOP_SECS: u32 = 30;
+
+pub const PACKAGE: &str = "io.github.aabolfazl.perfagent";
+
+mod bundle {
+    include!(concat!(env!("OUT_DIR"), "/agent_apk.rs"));
+}
+
+pub fn bundled_apk() -> Option<&'static [u8]> {
+    bundle::BUNDLED_APK
+}
+
+pub fn version_code(version: &str) -> u32 {
+    let core = version.split(['-', '+']).next().unwrap_or_default();
+    let mut parts = core.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let mut next = || parts.next().unwrap_or(0);
+    let (major, minor, patch) = (next(), next(), next());
+    major * 10_000 + minor * 100 + patch
+}
+
+pub fn expected_version_code() -> u32 {
+    version_code(env!("CARGO_PKG_VERSION"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub version_name: String,
+    pub version_code: u32,
+}
+
+pub fn parse_installed(dumpsys: &str) -> Option<Installed> {
+    let mut code = None;
+    let mut name = None;
+    for token in dumpsys.split_whitespace() {
+        if let Some(v) = token.strip_prefix("versionCode=") {
+            code = code.or_else(|| v.parse().ok());
+        } else if let Some(v) = token.strip_prefix("versionName=") {
+            name = name.or_else(|| Some(v.to_string()));
+        }
+    }
+    Some(Installed {
+        version_code: code?,
+        version_name: name.unwrap_or_default(),
+    })
+}
+
+pub async fn installed(serial: &str) -> Result<Option<Installed>> {
+    let script = format!("dumpsys package {PACKAGE} | grep -E 'versionCode=|versionName='; true");
+    let out = crate::adb::shell_once(Some(serial), &script).await?;
+    Ok(parse_installed(&out))
+}
+
+pub async fn vpn_allowed(serial: &str) -> Result<bool> {
+    let script = format!("appops get {PACKAGE} ACTIVATE_VPN; true");
+    let out = crate::adb::shell_once(Some(serial), &script).await?;
+    Ok(out.contains("ACTIVATE_VPN: allow"))
+}
+
+#[derive(Debug)]
+pub enum InstallError {
+    Incompatible(String),
+    Failed(String),
+}
+
+pub async fn install(serial: &str, apk: &[u8], replace: bool) -> Result<bool, InstallError> {
+    let path = std::env::temp_dir().join(format!("adbtop-agent-{}.apk", std::process::id()));
+    std::fs::write(&path, apk)
+        .map_err(|e| InstallError::Failed(format!("writing {}: {e}", path.display())))?;
+    let result = install_path(serial, &path, replace).await;
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+async fn install_path(serial: &str, path: &Path, replace: bool) -> Result<bool, InstallError> {
+    match adb_install(serial, path).await {
+        Ok(()) => Ok(false),
+        Err(reason) if incompatible(&reason) && replace => {
+            uninstall(serial).await.map_err(InstallError::Failed)?;
+            adb_install(serial, path)
+                .await
+                .map_err(InstallError::Failed)?;
+            Ok(true)
+        }
+        Err(reason) if incompatible(&reason) => Err(InstallError::Incompatible(reason)),
+        Err(reason) => Err(InstallError::Failed(reason)),
+    }
+}
+
+fn incompatible(reason: &str) -> bool {
+    [
+        "INSTALL_FAILED_UPDATE_INCOMPATIBLE",
+        "INSTALL_FAILED_VERSION_DOWNGRADE",
+        "signatures do not match",
+    ]
+    .iter()
+    .any(|k| reason.contains(k))
+}
+
+fn adb_result(stdout: &[u8], stderr: &[u8], success: bool) -> Result<(), String> {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    if success && text.contains("Success") {
+        return Ok(());
+    }
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.contains("Failure") || l.contains("failed"))
+        .unwrap_or(text.trim());
+    Err(line.to_string())
+}
+
+async fn adb_install(serial: &str, path: &Path) -> Result<(), String> {
+    let out = crate::adb::command(Some(serial))
+        .arg("install")
+        .arg("-r")
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("running adb: {e}"))?;
+    adb_result(&out.stdout, &out.stderr, out.status.success())
+}
+
+pub async fn uninstall(serial: &str) -> Result<(), String> {
+    let out = crate::adb::command(Some(serial))
+        .args(["uninstall", PACKAGE])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("running adb: {e}"))?;
+    adb_result(&out.stdout, &out.stderr, out.status.success())
+}
 
 pub async fn start_capture(serial: Option<&str>, app: Option<&str>) -> Result<()> {
     let mut cmd = crate::adb::command(serial);
@@ -432,8 +568,40 @@ pub mod tests {
     }
 
     #[test]
+    fn agent_versions() {
+        assert_eq!(version_code("0.2.0"), 200);
+        assert_eq!(version_code("1.12.3-rc.1"), 11203);
+        assert_eq!(version_code("2"), 20000);
+        let dumpsys = "    versionCode=200 minSdk=29 targetSdk=35\n    versionName=0.2.0\n    versionCode=1 minSdk=29 targetSdk=35\n";
+        assert_eq!(
+            parse_installed(dumpsys),
+            Some(Installed {
+                version_name: "0.2.0".into(),
+                version_code: 200
+            })
+        );
+        assert_eq!(parse_installed(""), None);
+    }
+
+    #[test]
+    fn install_output() {
+        assert!(adb_result(b"Performing Streamed Install\nSuccess\n", b"", true).is_ok());
+        let err = adb_result(
+            b"Performing Streamed Install\n",
+            b"adb: failed to install x.apk: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not match]\n",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("adb: failed to install"));
+        assert!(incompatible(&err));
+        assert!(!incompatible(
+            "Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"
+        ));
+    }
+
+    #[test]
     fn reuses_a_forward_left_by_an_earlier_run() {
-        let list = "RFCX11HALEL tcp:58638 localabstract:android-perf-agent\nRFCX11HALEL tcp:58999 localabstract:android-perf-agent-pcap\nOTHER tcp:1 localabstract:android-perf-agent\n";
+        let list = "RFCX11HALEL tcp:58638 localabstract:adbtop-agent\nRFCX11HALEL tcp:58999 localabstract:adbtop-agent-pcap\nOTHER tcp:1 localabstract:adbtop-agent\n";
         assert_eq!(
             existing_forward(list, Some("RFCX11HALEL"), STATS_SOCKET),
             Some(58638)

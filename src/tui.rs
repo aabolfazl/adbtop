@@ -64,6 +64,7 @@ pub struct App {
     pub config: Config,
     pub session: Session,
     pub paused: bool,
+    live: Option<Session>,
     pub window_s: u32,
     pub serial: Option<String>,
     pub devices: Vec<Device>,
@@ -91,6 +92,40 @@ pub struct App {
 impl App {
     pub fn t(&self) -> &Theme {
         &self.themes[self.theme]
+    }
+
+    fn toggle_pause(&mut self) {
+        if self.paused {
+            self.resume();
+        } else {
+            self.live = Some(self.session.clone());
+            self.paused = true;
+        }
+    }
+
+    fn resume(&mut self) {
+        if let Some(live) = self.live.take() {
+            self.session = live;
+        }
+        self.paused = false;
+    }
+
+    fn current(&mut self) -> &mut Session {
+        self.live.as_mut().unwrap_or(&mut self.session)
+    }
+
+    fn mark(&mut self, label: &str) {
+        self.session.add_marker(label);
+        if let Some(live) = self.live.as_mut() {
+            live.add_marker(label);
+        }
+    }
+
+    fn set_support(&mut self, source: Source, support: crate::model::Support) {
+        self.session.support[source.index()] = support.clone();
+        if let Some(live) = self.live.as_mut() {
+            live.support[source.index()] = support;
+        }
     }
 
     pub fn package(&self) -> Option<&str> {
@@ -134,6 +169,7 @@ impl App {
             };
             tokio::spawn(restore_tweaks(self.serial.clone(), restore));
         }
+        self.resume();
         self.session.reset_app(package.clone());
         self.scroll = [0; 6];
         let _ = self.package_tx.send(package.clone());
@@ -357,7 +393,7 @@ pub fn settings_rows(app: &App) -> Vec<SettingRow> {
                 CaptureMode::Off => "off".into(),
                 CaptureMode::Ask => "ask".into(),
             },
-            "on: starts with the monitor · ask: press c · off: disabled",
+            "on: starts with adbtop · ask: press c · off: disabled",
         ),
         row(Setting::Power, "", "Battery & thermal", on(c.power), ""),
         row(
@@ -554,10 +590,33 @@ fn run_act(app: &mut App, rt: &Runtime, act: Act) {
         Act::Console => {
             app.popup = Popup::Prompt;
         }
+        Act::InstallAgent => {
+            let Some(apk) = crate::agent::bundled_apk() else {
+                app.popup = Popup::None;
+                app.toast(
+                    "this build has no bundled agent: adbtop agent install --apk FILE",
+                    true,
+                );
+                return;
+            };
+            let path = std::env::temp_dir().join("adbtop-agent.apk");
+            if let Err(e) = std::fs::write(&path, apk) {
+                app.popup = Popup::None;
+                app.toast(format!("writing {}: {e}", path.display()), true);
+                return;
+            }
+            app.set_support(Source::Capture, crate::model::Support::Unknown);
+            run_console(
+                app,
+                rt,
+                vec!["install".into(), "-r".into(), path.display().to_string()],
+                "install capture agent".into(),
+            );
+        }
         Act::Launch | Act::Restart => {
             let restart = act == Act::Restart;
             if restart {
-                app.session.add_marker("cold start");
+                app.mark("cold start");
             }
             let title = format!("{} {pkg}", if restart { "cold restart" } else { "launch" });
             run_console(
@@ -693,6 +752,7 @@ fn start_collectors(app: &mut App, rt: &mut Runtime) {
     let history = app.config.history_samples(interval);
     let package = app.session.package.clone();
     let serial = app.serial.clone();
+    app.resume();
     app.session = Session::new(serial.clone(), package, interval, history);
     app.session.devices = app.devices.clone();
     if serial.is_none() {
@@ -712,6 +772,14 @@ fn start_collectors(app: &mut App, rt: &mut Runtime) {
     app.pcap_started |= app.pcap.is_some();
 }
 
+fn agent_hint(reason: &str) -> String {
+    if reason == crate::agent::NOT_INSTALLED {
+        "capture agent is not installed: press a, then i".to_string()
+    } else {
+        reason.to_string()
+    }
+}
+
 fn toggle_capture(app: &mut App, rt: &Runtime) {
     let Some(serial) = app.serial.clone() else {
         app.toast("no device selected", true);
@@ -726,7 +794,7 @@ fn toggle_capture(app: &mut App, rt: &Runtime) {
     }
     if let crate::model::Support::Unsupported(reason) = app.session.support(Source::Capture).clone()
     {
-        app.toast(reason, true);
+        app.toast(agent_hint(&reason), true);
         return;
     }
     app.capture_busy = true;
@@ -968,7 +1036,7 @@ fn handle_key(app: &mut App, rt: &mut Runtime, key: KeyEvent) {
                 KeyCode::Esc => app.popup = Popup::None,
                 KeyCode::Enter => {
                     let label = std::mem::take(&mut app.input);
-                    app.session.add_marker(label.trim());
+                    app.mark(label.trim());
                     app.popup = Popup::None;
                 }
                 KeyCode::Backspace => {
@@ -1047,7 +1115,7 @@ fn handle_key(app: &mut App, rt: &mut Runtime, key: KeyEvent) {
         KeyCode::Char(c @ '1'..='6') => app.page = c as usize - '1' as usize,
         KeyCode::Tab => app.page = (app.page + 1) % PAGES.len(),
         KeyCode::BackTab => app.page = (app.page + PAGES.len() - 1) % PAGES.len(),
-        KeyCode::Char(' ') => app.paused = !app.paused,
+        KeyCode::Char(' ') => app.toggle_pause(),
         KeyCode::Char('d') => {
             app.popup = Popup::Device;
             app.cursor = app
@@ -1066,7 +1134,7 @@ fn handle_key(app: &mut App, rt: &mut Runtime, key: KeyEvent) {
         }
         KeyCode::Char('x') => app.set_package(None),
         KeyCode::Char('c') => toggle_capture(app, rt),
-        KeyCode::Char('m') => app.session.add_marker(""),
+        KeyCode::Char('m') => app.mark(""),
         KeyCode::Char('M') => {
             app.input.clear();
             app.popup = Popup::Marker;
@@ -1236,7 +1304,7 @@ pub async fn run(common: Common, theme_arg: Option<String>) -> i32 {
         config.interval_ms = i.as_millis().clamp(200, 60_000) as u64;
     }
     if let Err(e) = enable_raw_mode() {
-        eprintln!("this needs an interactive terminal ({e}); for scripts use `android-perf-monitor record`");
+        eprintln!("this needs an interactive terminal ({e}); for scripts use `adbtop record`");
         return 1;
     }
     let default_hook = std::panic::take_hook();
@@ -1288,6 +1356,7 @@ pub async fn run(common: Common, theme_arg: Option<String>) -> i32 {
         session: Session::new(None, package, interval, config.history_samples(interval)),
         config,
         paused: false,
+        live: None,
         window_s,
         serial: common.device.clone(),
         devices: Vec::new(),
@@ -1362,14 +1431,11 @@ pub async fn run(common: Common, theme_arg: Option<String>) -> i32 {
             } => {
                 match update {
                     Some(update) => {
-                        let data = matches!(update, Update::Fast(_) | Update::AppMemory(_) | Update::Frames(_) | Update::Battery(_) | Update::Thermal(_) | Update::Doze(_) | Update::Jobs(_) | Update::Capture(_));
-                        if !(app.paused && data) {
-                            if let Update::CaptureError(e) = &update {
-                                app.toast(format!("capture: {e}"), true);
-                            }
-                            app.session.apply(update);
-                            dirty = true;
+                        if let Update::CaptureError(e) = &update {
+                            app.toast(format!("capture: {e}"), true);
                         }
+                        app.current().apply(update);
+                        dirty = true;
                         if !capture_requested && auto_capture && app.session.caps.is_some() {
                             capture_requested = true;
                             toggle_capture(&mut app, &rt);
@@ -1400,9 +1466,9 @@ pub async fn run(common: Common, theme_arg: Option<String>) -> i32 {
                     Ok(on) => app.capture_on = on,
                     Err(e) => {
                         if e == crate::agent::NOT_INSTALLED {
-                            app.session.support[Source::Capture.index()] = crate::model::Support::Unsupported(e.clone());
+                            app.set_support(Source::Capture, crate::model::Support::Unsupported(e.clone()));
                         }
-                        app.toast(format!("capture: {e}"), true);
+                        app.toast(format!("capture: {}", agent_hint(&e)), true);
                     }
                 }
                 dirty = true;
@@ -1435,7 +1501,7 @@ pub async fn run(common: Common, theme_arg: Option<String>) -> i32 {
             let mut err = io::stderr();
             let _ = match done {
                 Ok(Ok(_)) => writeln!(err, "stopped the network capture on {}", serial.as_deref().unwrap_or("the device")),
-                _ => writeln!(err, "could not stop the network capture; the agent stops by itself {} s after the monitor is gone", crate::agent::IDLE_STOP_SECS),
+                _ => writeln!(err, "could not stop the network capture; the agent stops by itself {} s after adbtop is gone", crate::agent::IDLE_STOP_SECS),
             };
         }
         if let Ok(mut slot) = EMERGENCY_CLEANUP.lock() {

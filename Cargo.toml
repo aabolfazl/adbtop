@@ -1,11 +1,25 @@
 [package]
-name = "android-perf-monitor"
+name = "adbtop"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
-description = "Android performance monitor: an interactive TUI, plus headless recording with JSON reports for scripts, CI and AI agents"
+description = "Live performance for Android apps over adb: a terminal UI, plus JSON and CSV recording for scripts, CI and AI agents"
 authors = ["Abolfazl Abbasi"]
 license = "MIT"
+repository = "https://github.com/aabolfazl/adbtop"
+homepage = "https://github.com/aabolfazl/adbtop"
+readme = "README.md"
+keywords = ["android", "adb", "performance", "profiling", "tui"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+include = [
+    "/src/**",
+    "/build.rs",
+    "/proto/**",
+    "/agent/adbtop-agent.apk",
+    "/skills/adbtop/SKILL.md",
+    "/README.md",
+    "/LICENSE",
+]
 
 [dependencies]
 ratatui = "0.29"

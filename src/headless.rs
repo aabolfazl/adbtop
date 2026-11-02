@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::cli::{groups, Command, Common, RecordArgs, SnapshotArgs};
+use crate::cli::{groups, AgentAction, Command, Common, RecordArgs, SnapshotArgs};
 use crate::collect::{self, Groups};
 use crate::config::Config;
 use crate::model::{AppState, Source, Support};
@@ -55,6 +55,8 @@ pub async fn run(command: Command, common: Common) -> i32 {
         Command::Devices => devices().await,
         Command::Packages => packages(common).await,
         Command::Themes => themes(),
+        Command::Agent { action } => agent(action, common).await,
+        Command::Skill { action } => crate::skill::run(action),
     }
 }
 
@@ -133,7 +135,7 @@ struct SessionFile {
 }
 
 fn sessions_dir() -> PathBuf {
-    std::env::temp_dir().join("android-perf-monitor")
+    std::env::temp_dir().join("adbtop")
 }
 
 fn new_session_id() -> String {
@@ -415,10 +417,11 @@ async fn record(args: RecordArgs, common: Common) -> i32 {
     }
     if !args.quiet {
         let target = common.package.as_deref().unwrap_or("the whole device");
-        let until = args.duration.map_or(
-            "until `android-perf-monitor stop` or Ctrl+C".to_string(),
-            |d| format!("for {:.0} s", d.as_secs_f64()),
-        );
+        let until = args
+            .duration
+            .map_or("until `adbtop stop` or Ctrl+C".to_string(), |d| {
+                format!("for {:.0} s", d.as_secs_f64())
+            });
         eprintln!("recording {target} on {} (session {id}) {until}", p.serial);
     }
 
@@ -575,7 +578,7 @@ async fn control(session: Option<String>, command: String) -> i32 {
             Err(_) => {
                 return fail(
                     "no_session",
-                    "no recording is running (start one with `android-perf-monitor record`)",
+                    "no recording is running (start one with `adbtop record`)",
                     EXIT_ERROR,
                 )
             }
@@ -713,6 +716,140 @@ async fn packages(common: Common) -> i32 {
             EXIT_OK
         }
         Err(e) => fail("adb_error", e.to_string(), EXIT_ERROR),
+    }
+}
+
+#[derive(Serialize)]
+struct AgentStatus<'a> {
+    serial: &'a str,
+    installed: bool,
+    version: Option<String>,
+    version_code: Option<u32>,
+    expected_version: &'static str,
+    up_to_date: bool,
+    vpn_allowed: bool,
+    bundled: bool,
+}
+
+#[derive(Serialize)]
+struct AgentInstalled<'a> {
+    serial: &'a str,
+    installed: bool,
+    version: Option<String>,
+    previous: Option<String>,
+    replaced: bool,
+    vpn_allowed: bool,
+}
+
+#[derive(Serialize)]
+struct AgentRemoved<'a> {
+    serial: &'a str,
+    uninstalled: bool,
+    version: String,
+}
+
+pub fn print_json<T: Serialize>(value: &T) -> i32 {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    );
+    EXIT_OK
+}
+
+async fn agent(action: AgentAction, common: Common) -> i32 {
+    let serial = match resolve_device(common.device.as_deref()).await {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let before = match crate::agent::installed(&serial).await {
+        Ok(i) => i,
+        Err(e) => return fail("adb_error", e.to_string(), EXIT_ERROR),
+    };
+    match action {
+        AgentAction::Status => {
+            let vpn_allowed =
+                before.is_some() && crate::agent::vpn_allowed(&serial).await.unwrap_or(false);
+            print_json(&AgentStatus {
+                serial: &serial,
+                installed: before.is_some(),
+                up_to_date: before
+                    .as_ref()
+                    .is_some_and(|i| i.version_code >= crate::agent::expected_version_code()),
+                version_code: before.as_ref().map(|i| i.version_code),
+                version: before.map(|i| i.version_name),
+                expected_version: env!("CARGO_PKG_VERSION"),
+                vpn_allowed,
+                bundled: crate::agent::bundled_apk().is_some(),
+            })
+        }
+        AgentAction::Install { apk, replace } => {
+            let bytes = match apk {
+                Some(path) => match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return fail(
+                            "apk_unreadable",
+                            format!("{}: {e}", path.display()),
+                            EXIT_ERROR,
+                        )
+                    }
+                },
+                None => match crate::agent::bundled_apk() {
+                    Some(b) => b.to_vec(),
+                    None => {
+                        return fail(
+                            "agent_not_bundled",
+                            format!(
+                                "this adbtop build has no bundled capture agent; download adbtop-agent-{v}.apk from https://github.com/aabolfazl/adbtop/releases/tag/v{v} and run `adbtop agent install --apk FILE`",
+                                v = env!("CARGO_PKG_VERSION")
+                            ),
+                            EXIT_ERROR,
+                        )
+                    }
+                },
+            };
+            eprintln!("installing the capture agent on {serial}");
+            let replaced = match crate::agent::install(&serial, &bytes, replace).await {
+                Ok(r) => r,
+                Err(crate::agent::InstallError::Incompatible(reason)) => {
+                    return fail(
+                        "agent_signature_mismatch",
+                        format!("{reason}; the agent on the phone was signed with a different key (for example a local build). `adbtop agent install --replace` removes it first, and the phone asks for the VPN permission again"),
+                        EXIT_ERROR,
+                    )
+                }
+                Err(crate::agent::InstallError::Failed(reason)) => {
+                    return fail("agent_install_failed", reason, EXIT_ERROR)
+                }
+            };
+            let after = crate::agent::installed(&serial).await.ok().flatten();
+            let vpn_allowed = crate::agent::vpn_allowed(&serial).await.unwrap_or(false);
+            print_json(&AgentInstalled {
+                serial: &serial,
+                installed: after.is_some(),
+                version: after.map(|i| i.version_name),
+                previous: before.map(|i| i.version_name),
+                replaced,
+                vpn_allowed,
+            })
+        }
+        AgentAction::Uninstall => {
+            let Some(before) = before else {
+                return fail(
+                    "agent_not_installed",
+                    format!("the capture agent is not installed on {serial}"),
+                    EXIT_NOT_FOUND,
+                );
+            };
+            match crate::agent::uninstall(&serial).await {
+                Ok(()) => print_json(&AgentRemoved {
+                    serial: &serial,
+                    uninstalled: true,
+                    version: before.version_name,
+                }),
+                Err(reason) => fail("agent_uninstall_failed", reason, EXIT_ERROR),
+            }
+        }
     }
 }
 

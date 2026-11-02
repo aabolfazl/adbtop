@@ -1,6 +1,6 @@
-# Android Perf Agent
+# adbtop agent
 
-A small Android app that lets the terminal UI see every app's network traffic, without root.
+A small Android app that lets [adbtop](../README.md) see every app's network traffic, without root.
 
 It works like a local VPN, the same way [PCAPdroid](https://github.com/emanuele-f/PCAPdroid) does:
 Android routes the apps' traffic into the agent, which forwards it to where it was going over
@@ -30,12 +30,12 @@ Requires Android 10 or newer.
 ## Use it from the terminal UI
 
 ```bash
-android-perf-monitor --capture -p com.example.app
-android-perf-monitor --pcap capture.pcap      # also save every packet for Wireshark
+adbtop --capture -p com.example.app
+adbtop --pcap capture.pcap      # also save every packet for Wireshark
 ```
 
 Or press `c` to start and stop the capture, and `5` for the Network page. The first time,
-the phone asks for VPN permission; accept it once. The capture stops when the monitor quits.
+the phone asks for VPN permission; accept it once. The capture stops when adbtop quits.
 
 ## Use it by hand
 
@@ -45,13 +45,13 @@ adb shell am start -n io.github.aabolfazl.perfagent/.ControlActivity --es cmd st
 adb shell am start -n io.github.aabolfazl.perfagent/.ControlActivity --es cmd stop
 
 # Live pcap into Wireshark
-adb forward tcp:5555 localabstract:android-perf-agent-pcap
+adb forward tcp:5555 localabstract:adbtop-agent-pcap
 nc localhost 5555 | wireshark -k -i -
 ```
 
-`--ei idle_stop N` makes the agent stop itself once no client has been connected to the snapshot socket for N seconds. The monitor always passes `--ei idle_stop 30`, so a monitor that was killed or lost its cable does not leave the VPN running.
+`--ei idle_stop N` makes the agent stop itself once no client has been connected to the snapshot socket for N seconds. adbtop always passes `--ei idle_stop 30`, so an adbtop that was killed or lost its cable does not leave the VPN running.
 
-The snapshot stream is on `localabstract:android-perf-agent`: length-delimited protobuf
+The snapshot stream is on `localabstract:adbtop-agent`: length-delimited protobuf
 `Snapshot` messages, defined in [`../proto/agent.proto`](../proto/agent.proto). Only adb (the
 shell user) and root can connect to either socket, so other apps on the phone can't read it.
 

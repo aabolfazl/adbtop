@@ -323,6 +323,7 @@ pub enum Act {
     Bucket,
     Unplug,
     ResetFrames,
+    InstallAgent,
     Console,
 }
 
@@ -419,6 +420,18 @@ pub fn menu(tweaks: &Tweaks, bucket_now: Option<&str>) -> Vec<ActionItem> {
             },
             "dumpsys battery unplug / reset",
             Act::Unplug,
+            false,
+        ),
+        item(
+            'i',
+            "CAPTURE",
+            "Install or update the capture agent".into(),
+            if crate::agent::bundled_apk().is_some() {
+                "adb install -r (the agent bundled with adbtop)"
+            } else {
+                "not bundled in this build: adbtop agent install --apk"
+            },
+            Act::InstallAgent,
             false,
         ),
         item(

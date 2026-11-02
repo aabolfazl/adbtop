@@ -9,6 +9,7 @@ mod model;
 mod parse;
 mod report;
 mod session;
+mod skill;
 mod theme;
 mod tui;
 mod ui;

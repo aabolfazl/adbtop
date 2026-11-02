@@ -354,7 +354,9 @@ async fn frames_task(
         }
         let Some(pkg) = pkg else { continue };
         match shell
-            .exec(format!("dumpsys gfxinfo {pkg} framestats"))
+            .exec(format!(
+                "dumpsys gfxinfo {pkg} framestats; echo ==U; cat /proc/uptime"
+            ))
             .await
         {
             Ok(out) => {

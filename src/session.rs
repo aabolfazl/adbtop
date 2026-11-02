@@ -143,6 +143,9 @@ pub struct History {
     pub cluster_cap_ghz: Vec<Series>,
     pub app_threads: Series,
     pub mem_avail_gb: Series,
+    pub mem_used_gb: Series,
+    pub mem_cached_gb: Series,
+    pub mem_free_gb: Series,
     pub swap_used_gb: Series,
     pub psi_some: Series,
     pub dev_rx: Series,
@@ -162,6 +165,7 @@ pub struct History {
     pub fps: Series,
     pub jank_pct: Series,
     pub drain_ma: Series,
+    pub charge_ma: Series,
     pub thermal_status: Series,
     pub temps: Vec<(String, Series)>,
     pub deep_idle: Series,
@@ -182,6 +186,9 @@ impl History {
             cluster_cap_ghz: Vec::new(),
             app_threads: s(),
             mem_avail_gb: s(),
+            mem_used_gb: s(),
+            mem_cached_gb: s(),
+            mem_free_gb: s(),
             swap_used_gb: s(),
             psi_some: s(),
             dev_rx: s(),
@@ -201,6 +208,7 @@ impl History {
             fps: s(),
             jank_pct: s(),
             drain_ma: s(),
+            charge_ma: s(),
             thermal_status: s(),
             temps: Vec::new(),
             deep_idle: s(),
@@ -215,6 +223,92 @@ impl History {
             s.push(f32::NAN);
         }
         s
+    }
+
+    fn push_gap(&mut self) {
+        let History {
+            cap: _,
+            app_cpu,
+            app_kernel,
+            sys_cpu,
+            cores,
+            cluster_ghz,
+            cluster_cap_ghz,
+            app_threads,
+            mem_avail_gb,
+            mem_used_gb,
+            mem_cached_gb,
+            mem_free_gb,
+            swap_used_gb,
+            psi_some,
+            dev_rx,
+            dev_tx,
+            cap_rx,
+            cap_tx,
+            pss_mb,
+            java_mb,
+            native_mb,
+            code_mb,
+            stack_mb,
+            graphics_mb,
+            other_mb,
+            system_mb,
+            heap_size_mb,
+            heap_alloc_mb,
+            fps,
+            jank_pct,
+            drain_ma,
+            charge_ma,
+            thermal_status,
+            temps,
+            deep_idle,
+            light_idle,
+            bucket,
+        } = self;
+        for s in [
+            app_cpu,
+            app_kernel,
+            sys_cpu,
+            app_threads,
+            mem_avail_gb,
+            mem_used_gb,
+            mem_cached_gb,
+            mem_free_gb,
+            swap_used_gb,
+            psi_some,
+            dev_rx,
+            dev_tx,
+            cap_rx,
+            cap_tx,
+            pss_mb,
+            java_mb,
+            native_mb,
+            code_mb,
+            stack_mb,
+            graphics_mb,
+            other_mb,
+            system_mb,
+            heap_size_mb,
+            heap_alloc_mb,
+            fps,
+            jank_pct,
+            drain_ma,
+            charge_ma,
+            thermal_status,
+            deep_idle,
+            light_idle,
+            bucket,
+        ] {
+            s.push(f32::NAN);
+        }
+        for s in cores
+            .iter_mut()
+            .chain(cluster_ghz.iter_mut())
+            .chain(cluster_cap_ghz.iter_mut())
+            .chain(temps.iter_mut().map(|(_, s)| s))
+        {
+            s.push(f32::NAN);
+        }
     }
 }
 
@@ -273,7 +367,7 @@ pub struct DnsRecord {
     pub failed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Capture {
     pub snapshot: Option<proto::Snapshot>,
     pub rates: HashMap<i32, (f64, f64)>,
@@ -421,6 +515,7 @@ pub fn format_ip(bytes: &[u8]) -> String {
     }
 }
 
+#[derive(Clone)]
 pub struct Session {
     pub started: Instant,
     pub started_at: DateTime<Local>,
@@ -431,6 +526,8 @@ pub struct Session {
     pub support: Vec<Support>,
     pub last_error: Option<(Source, String)>,
     pub ticks: u64,
+    first_tick_at: Option<Instant>,
+    last_tick_at: Option<Instant>,
     pub markers: Vec<Marker>,
     pub fast: Option<FastSample>,
     pub app_state: AppState,
@@ -441,8 +538,9 @@ pub struct Session {
     pub frame_summary: Option<FrameSummary>,
     pub frame_base: Option<FrameSummary>,
     frame_pid: u32,
-    pending_frames: u32,
-    pending_janky: u32,
+    frames_at: Option<Instant>,
+    frame_uptime: Option<f64>,
+    frame_rate: Option<(f32, f32)>,
     pub battery: Option<Battery>,
     pub battery_first: Option<Battery>,
     pub thermal: Option<Thermal>,
@@ -499,6 +597,8 @@ impl Session {
             support: vec![Support::Unknown; Source::ALL.len()],
             last_error: None,
             ticks: 0,
+            first_tick_at: None,
+            last_tick_at: None,
             markers: Vec::new(),
             fast: None,
             app_state: AppState::NotSelected,
@@ -509,8 +609,9 @@ impl Session {
             frame_summary: None,
             frame_base: None,
             frame_pid: 0,
-            pending_frames: 0,
-            pending_janky: 0,
+            frames_at: None,
+            frame_uptime: None,
+            frame_rate: None,
             battery: None,
             battery_first: None,
             thermal: None,
@@ -535,7 +636,14 @@ impl Session {
     }
 
     pub fn interval_s(&self) -> f32 {
-        self.interval.as_secs_f32()
+        let set = self.interval.as_secs_f32();
+        match (self.first_tick_at, self.last_tick_at) {
+            (Some(a), Some(b)) if self.ticks >= 5 => {
+                let measured = b.duration_since(a).as_secs_f32() / (self.ticks - 1) as f32;
+                measured.max(set)
+            }
+            _ => set,
+        }
     }
 
     pub fn reset_app(&mut self, package: Option<String>) {
@@ -601,13 +709,29 @@ impl Session {
                         self.frame_base = Some(u.summary.clone());
                     }
                     self.frame_pid = u.pid;
-                    for f in &u.frames {
-                        if !u.baseline {
-                            self.pending_frames += 1;
-                            if f.janky {
-                                self.pending_janky += 1;
+                    let now = Instant::now();
+                    let counts = self.frame_summary.as_ref().map(|p| (p.total, p.janky));
+                    self.frame_rate = match (self.frames_at, counts) {
+                        (Some(at), Some((total, janky))) if !u.baseline && !restart => {
+                            let dt = match (self.frame_uptime, u.uptime_s) {
+                                (Some(a), Some(b)) if b > a => (b - a) as f32,
+                                _ => now.duration_since(at).as_secs_f32(),
                             }
+                            .max(0.2);
+                            let n = u.summary.total.saturating_sub(total) as f32;
+                            let j = u.summary.janky.saturating_sub(janky) as f32;
+                            let pct = if n > 0.0 {
+                                (j * 100.0 / n).min(100.0)
+                            } else {
+                                0.0
+                            };
+                            Some((n / dt, pct))
                         }
+                        _ => None,
+                    };
+                    self.frames_at = Some(now);
+                    self.frame_uptime = u.uptime_s;
+                    for f in &u.frames {
                         if self.frames.len() == FRAME_HISTORY {
                             self.frames.pop_front();
                         }
@@ -650,6 +774,20 @@ impl Session {
     }
 
     fn on_fast(&mut self, s: FastSample) {
+        let now = Instant::now();
+        if let Some(last) = self.last_tick_at {
+            let period = self.interval_s().max(0.05);
+            let steps = (now.duration_since(last).as_secs_f32() / period).round() as u64;
+            if steps >= 3 {
+                let missed = (steps - 1).min(self.history.cap as u64);
+                for _ in 0..missed {
+                    self.history.push_gap();
+                }
+                self.ticks += missed;
+            }
+        }
+        self.first_tick_at.get_or_insert(now);
+        self.last_tick_at = Some(now);
         let nan = f32::NAN;
         self.app_state = s.app_state;
         if s.restarted {
@@ -723,12 +861,25 @@ impl Session {
 
         match &s.mem {
             Some(m) => {
-                h.mem_avail_gb.push(m.available_kb as f32 / 1048576.0);
-                h.swap_used_gb.push(m.swap_used_kb() as f32 / 1048576.0);
+                let gb = |kb: u64| kb as f32 / 1048576.0;
+                let cached = m.cached_kb.min(m.available_kb);
+                h.mem_avail_gb.push(gb(m.available_kb));
+                h.mem_used_gb.push(gb(m.used_kb()));
+                h.mem_cached_gb.push(gb(cached));
+                h.mem_free_gb
+                    .push(gb(m.available_kb.saturating_sub(cached)));
+                h.swap_used_gb.push(gb(m.swap_used_kb()));
             }
             None => {
-                h.mem_avail_gb.push(nan);
-                h.swap_used_gb.push(nan);
+                for series in [
+                    &mut h.mem_avail_gb,
+                    &mut h.mem_used_gb,
+                    &mut h.mem_cached_gb,
+                    &mut h.mem_free_gb,
+                    &mut h.swap_used_gb,
+                ] {
+                    series.push(nan);
+                }
             }
         }
         h.psi_some.push(s.psi.map_or(nan, |p| p.some_avg10));
@@ -777,26 +928,34 @@ impl Session {
             }
         }
 
-        if self.frame_summary.is_some() && running {
-            let dt = s.dt.max(0.05);
-            h.fps.push(self.pending_frames as f32 / dt);
-            h.jank_pct.push(if self.pending_frames > 0 {
-                self.pending_janky as f32 * 100.0 / self.pending_frames as f32
-            } else {
-                0.0
-            });
-        } else {
-            h.fps.push(nan);
-            h.jank_pct.push(nan);
+        let stale_after = (self.interval * 3).max(Duration::from_secs(3));
+        let rate = self
+            .frame_rate
+            .filter(|_| self.frame_summary.is_some() && running)
+            .filter(|_| self.frames_at.is_some_and(|at| at.elapsed() < stale_after));
+        match rate {
+            Some((fps, jank)) => {
+                h.fps.push(fps);
+                h.jank_pct.push(jank);
+            }
+            None => {
+                h.fps.push(nan);
+                h.jank_pct.push(nan);
+            }
         }
-        self.pending_frames = 0;
-        self.pending_janky = 0;
 
         h.drain_ma.push(
             self.battery
                 .as_ref()
                 .and_then(|b| b.drain_ma())
                 .unwrap_or(nan),
+        );
+        h.charge_ma.push(
+            self.battery
+                .as_ref()
+                .filter(|b| b.drain_ma().is_none())
+                .and_then(|b| b.current_ma)
+                .map_or(nan, |c| c.unsigned_abs() as f32),
         );
 
         match &self.thermal {
@@ -851,13 +1010,28 @@ impl Session {
             if e.name != t.name {
                 e.name = t.name.clone();
             }
+            let fresh = e.hist.is_empty();
+            let missed = tick
+                .saturating_sub(e.last_tick)
+                .saturating_sub(1)
+                .min(TASK_HISTORY as u64);
+            for _ in 0..missed {
+                if e.hist.len() == TASK_HISTORY {
+                    e.hist.pop_front();
+                }
+                e.hist.push_back(f32::NAN);
+            }
             if e.hist.len() == TASK_HISTORY {
                 e.hist.pop_front();
             }
-            e.hist.push_back(t.cpu);
-            e.sum += t.cpu as f64;
-            e.n += 1;
-            e.peak = e.peak.max(t.cpu);
+            if fresh {
+                e.hist.push_back(f32::NAN);
+            } else {
+                e.hist.push_back(t.cpu);
+                e.sum += t.cpu as f64;
+                e.n += 1;
+                e.peak = e.peak.max(t.cpu);
+            }
             e.last_tick = tick;
         }
         if tick % 30 == 0 {
@@ -1084,16 +1258,36 @@ mod tests {
             baseline: true,
             frames: vec![],
             summary: summary(100, 5, vec![(5, 90), (20, 10)]),
+            uptime_s: Some(10.0),
         })));
         s.apply(Update::Frames(Some(FrameUpdate {
             pid: 1,
             baseline: false,
             frames: vec![],
             summary: summary(200, 7, vec![(5, 170), (20, 30)]),
+            uptime_s: Some(12.0),
         })));
         let d = s.frames_since_start().unwrap();
         assert_eq!((d.total, d.janky), (100, 2));
         assert_eq!(d.p50_ms, 5);
         assert_eq!(d.p90_ms, 20);
+        let (fps, jank) = s.frame_rate.unwrap();
+        assert!((fps - 50.0).abs() < 0.01, "{fps}");
+        assert!((jank - 2.0).abs() < 0.01, "{jank}");
+    }
+
+    #[test]
+    fn missed_samples_leave_a_gap_on_the_time_axis() {
+        let mut s = Session::new(None, None, Duration::from_secs(1), 60);
+        s.apply(Update::Fast(FastSample::default()));
+        assert_eq!((s.ticks, s.history.sys_cpu.len()), (1, 1));
+        s.last_tick_at = s
+            .last_tick_at
+            .and_then(|t| t.checked_sub(Duration::from_secs(5)));
+        s.apply(Update::Fast(FastSample::default()));
+        assert_eq!(s.ticks, 6);
+        assert_eq!(s.history.sys_cpu.len(), 6);
+        assert_eq!(s.history.pss_mb.len(), 6);
+        assert!(s.history.sys_cpu.get(3).is_nan());
     }
 }

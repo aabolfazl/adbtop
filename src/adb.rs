@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 
 use crate::model::Device;
 
-const END_MARKER: &str = "___APM_END_7f3a___";
+const END_MARKER: &str = "___ADBTOP_END_7f3a___";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 

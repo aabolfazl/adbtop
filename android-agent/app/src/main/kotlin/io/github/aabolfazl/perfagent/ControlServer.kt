@@ -20,8 +20,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Serves the computer over `adb forward`:
- *  - "android-perf-agent": one length-delimited protobuf [Snapshot] per second.
- *  - "android-perf-agent-pcap": a live pcap stream of every packet.
+ *  - "adbtop-agent": one length-delimited protobuf [Snapshot] per second.
+ *  - "adbtop-agent-pcap": a live pcap stream of every packet.
  *
  * Both are abstract unix sockets. Any app on the phone could connect to them, so only adb
  * (the shell user) and root are served.
@@ -165,8 +165,8 @@ internal class ControlServer(private val engine: Engine) : SnapshotListener, Clo
     }
 
     companion object {
-        const val STATS_SOCKET = "android-perf-agent"
-        const val PCAP_SOCKET = "android-perf-agent-pcap"
+        const val STATS_SOCKET = "adbtop-agent"
+        const val PCAP_SOCKET = "adbtop-agent-pcap"
         private const val SHELL_UID = 2000
     }
 }
