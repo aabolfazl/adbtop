@@ -1,6 +1,6 @@
 [package]
 name = "adbtop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.78"
 description = "Live performance for Android apps over adb: a terminal UI, plus JSON and CSV recording for scripts, CI and AI agents"
