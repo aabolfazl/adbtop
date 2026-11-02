@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.VpnService
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import io.github.aabolfazl.perfagent.engine.Engine
@@ -22,6 +24,20 @@ class CaptureService : VpnService() {
     private var engine: Engine? = null
     private var server: ControlServer? = null
     private var appFilter: String? = null
+    private val watchdog = Handler(Looper.getMainLooper())
+    private var idleStopMillis = 0L
+    private val idleCheck = object : Runnable {
+        override fun run() {
+            val current = server ?: return
+            if (idleStopMillis > 0 && current.idleMillis() >= idleStopMillis) {
+                Log.i(TAG, "No monitor connected for ${idleStopMillis / 1000} s, stopping the capture")
+                stopCapture()
+                stopSelf()
+                return
+            }
+            watchdog.postDelayed(this, IDLE_CHECK_MILLIS)
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -29,9 +45,19 @@ class CaptureService : VpnService() {
                 stopCapture()
                 stopSelf()
             }
-            ACTION_START -> startCapture(intent.getStringExtra(EXTRA_APP)?.takeIf { it.isNotBlank() })
+            ACTION_START -> {
+                startCapture(intent.getStringExtra(EXTRA_APP)?.takeIf { it.isNotBlank() })
+                setIdleStop(intent.getIntExtra(EXTRA_IDLE_STOP, 0))
+            }
         }
         return START_NOT_STICKY
+    }
+
+    private fun setIdleStop(seconds: Int) {
+        watchdog.removeCallbacks(idleCheck)
+        idleStopMillis = seconds.coerceAtLeast(0) * 1000L
+        server?.markClientSeen()
+        if (idleStopMillis > 0 && server != null) watchdog.postDelayed(idleCheck, IDLE_CHECK_MILLIS)
     }
 
     private fun startCapture(filter: String?) {
@@ -88,6 +114,8 @@ class CaptureService : VpnService() {
     }
 
     private fun stopCapture() {
+        watchdog.removeCallbacks(idleCheck)
+        idleStopMillis = 0
         server?.close()
         tunDevice?.close()
         engine?.stop()
@@ -118,12 +146,17 @@ class CaptureService : VpnService() {
         private const val ACTION_START = "io.github.aabolfazl.perfagent.START"
         private const val ACTION_STOP = "io.github.aabolfazl.perfagent.STOP"
         private const val EXTRA_APP = "app"
+        private const val EXTRA_IDLE_STOP = "idle_stop"
+        private const val IDLE_CHECK_MILLIS = 5_000L
         private const val MTU = 1500
         private const val VPN_ADDRESS = "10.215.173.1"
         private const val DNS_ADDRESS = "10.215.173.2"
 
-        fun startIntent(context: Context, app: String?): Intent =
-            Intent(context, CaptureService::class.java).setAction(ACTION_START).putExtra(EXTRA_APP, app)
+        fun startIntent(context: Context, app: String?, idleStopSeconds: Int): Intent =
+            Intent(context, CaptureService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_APP, app)
+                .putExtra(EXTRA_IDLE_STOP, idleStopSeconds)
 
         fun stopIntent(context: Context): Intent =
             Intent(context, CaptureService::class.java).setAction(ACTION_STOP)

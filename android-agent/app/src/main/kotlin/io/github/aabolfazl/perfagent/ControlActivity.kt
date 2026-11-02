@@ -49,13 +49,14 @@ class ControlActivity : Activity() {
     }
 
     private fun startCapture() {
-        startService(CaptureService.startIntent(this, intent.getStringExtra(EXTRA_APP)))
+        startService(CaptureService.startIntent(this, intent.getStringExtra(EXTRA_APP), intent.getIntExtra(EXTRA_IDLE_STOP, 0)))
         finish()
     }
 
     companion object {
         const val EXTRA_COMMAND = "cmd"
         const val EXTRA_APP = "app"
+        const val EXTRA_IDLE_STOP = "idle_stop"
         const val COMMAND_START = "start"
         const val COMMAND_STOP = "stop"
         private const val REQUEST_VPN_CONSENT = 1

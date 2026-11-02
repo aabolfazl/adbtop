@@ -4,6 +4,7 @@ import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import io.github.aabolfazl.perfagent.engine.Engine
 import io.github.aabolfazl.perfagent.engine.PcapStream
@@ -27,8 +28,14 @@ import java.util.concurrent.atomic.AtomicReference
  */
 internal class ControlServer(private val engine: Engine) : SnapshotListener, Closeable {
     private val clients = CopyOnWriteArrayList<StatsClient>()
-    private val stats = Listener(STATS_SOCKET) { socket -> clients.add(StatsClient(socket)) }
+    private val stats = Listener(STATS_SOCKET) { socket ->
+        clients.add(StatsClient(socket))
+        markClientSeen()
+    }
     private val pcap = Listener(PCAP_SOCKET) { socket -> startPcap(socket) }
+
+    @Volatile
+    private var lastClientAt = SystemClock.elapsedRealtime()
 
     fun start() {
         engine.snapshotListener = this
@@ -36,8 +43,15 @@ internal class ControlServer(private val engine: Engine) : SnapshotListener, Clo
         pcap.start()
     }
 
+    fun markClientSeen() {
+        lastClientAt = SystemClock.elapsedRealtime()
+    }
+
+    fun idleMillis(): Long = if (clients.isNotEmpty()) 0 else SystemClock.elapsedRealtime() - lastClientAt
+
     override fun onSnapshot(snapshot: Snapshot) {
         if (clients.isEmpty()) return
+        markClientSeen()
         val bytes = ByteArrayOutputStream().also { snapshot.writeDelimitedTo(it) }.toByteArray()
         for (client in clients) client.offer(bytes)
     }
