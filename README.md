@@ -193,6 +193,8 @@ All the fast `/proc` reads (CPU, threads, memory, network, clocks) are one `grep
 
 The [agent app](android-agent/README.md) runs a local VPN on the phone and streams protobuf snapshots ([`proto/agent.proto`](proto/agent.proto)) over `adb forward`.
 
+The long version, with diagrams and the bugs along the way: [How adbtop watches an Android app without touching it](https://latentbits.dev/writing/how-adbtop-works/).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
