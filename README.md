@@ -33,6 +33,14 @@ curl -LsSf https://github.com/aabolfazl/adbtop/releases/latest/download/adbtop-i
 
 The script also works on macOS. It puts `adbtop` in `~/.local/bin`. Prebuilt binaries for both are on the [releases page](https://github.com/aabolfazl/adbtop/releases).
 
+#### Arch Linux
+
+Install from the [official repositories](https://archlinux.org/packages/extra/x86_64/adbtop/):
+
+```bash
+pacman -S adbtop
+```
+
 ### With Cargo
 
 ```bash
